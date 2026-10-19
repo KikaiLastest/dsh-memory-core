@@ -1,0 +1,9 @@
+- insert:
+    - id: dsh-memory-core-a
+      name: dsh-memory-core-a
+      config:
+        memoryRoot: "D:\\dsh-workspace\\memory"
+        dialogueFile: "D:\\dsh-workspace\\对话记录.md"
+        topK: 3
+        timeoutMs: 150
+        maxBlockChars: 2400

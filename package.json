@@ -1,0 +1,33 @@
+{
+  "name": "dsh-memory-core",
+  "version": "0.1.0",
+  "description": "Memory recall + affect state for DeepSeek Harness: BM25-lite recall with source markers, consolidation to structured memory, and a two-scalar affect state.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "affect.mjs",
+    "consolidate.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "recall",
+    "affect"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/selftest.mjs && node test/affect.test.mjs && node test/eval.mjs",
+    "consolidate": "node consolidate.mjs"
+  }
+}
