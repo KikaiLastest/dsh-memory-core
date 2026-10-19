@@ -17,9 +17,23 @@
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
+    "cordis",
     "memory",
+    "agent-memory",
+    "long-term-memory",
+    "local-memory",
     "recall",
-    "affect"
+    "bm25",
+    "n-gram",
+    "chinese",
+    "keyword-search",
+    "context-management",
+    "affect",
+    "ai-agent",
+    "llm",
+    "markdown",
+    "jsonl",
+    "personal-assistant"
   ],
   "dsh": {
     "bundle": {
