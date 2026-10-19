@@ -20,11 +20,9 @@ function splitEntries(text, src) {
   let line = 1
   for (const part of parts) {
     const t = part.trim()
-    const advance = part.split('\n').length
-    if (t.length >= 40 && !/^\|/.test(t.split('\n')[1] || '')) {
-      out.push({ id: src + ':' + line, src, line, text: t })
-    }
-    line += advance
+    const adv = part.split('\n').length
+    if (t.length >= 40 && !/^\|/.test(t.split('\n')[1] || '')) out.push({ id: src + ':' + line, src, line, text: t })
+    line += adv
   }
   return out
 }
@@ -36,19 +34,42 @@ const entries = [
   ...splitEntries(readText(root + '/生长/状态.md'), 'state'),
 ]
 
-function buildIdf(es) {
-  const df = new Map()
-  for (const e of es) for (const g of new Set(grams(e.text))) df.set(g, (df.get(g) || 0) + 1)
-  const N = Math.max(1, es.length)
-  const idf = new Map()
-  for (const [g, n] of df) idf.set(g, Math.log(1 + (N - n + 0.5) / (n + 0.5)))
-  return idf
-}
-const idf = buildIdf(entries)
-
-function scoreEntry(queryGrams, entry) {
+const byId = new Map()
+const gramIndex = new Map()
+const df = new Map()
+for (const e of entries) {
+  const gs = grams(e.text)
   const tf = new Map()
-  for (const g of grams(entry.text)) tf.set(g, (tf.get(g) || 0) + 1)
+  for (const g of gs) tf.set(g, (tf.get(g) || 0) + 1)
+  e.tf = tf
+  byId.set(e.id, e)
+  for (const g of new Set(gs)) {
+    df.set(g, (df.get(g) || 0) + 1)
+    let set = gramIndex.get(g)
+    if (!set) {
+      set = new Set()
+      gramIndex.set(g, set)
+    }
+    set.add(e.id)
+  }
+}
+const N = Math.max(1, entries.length)
+const idf = new Map()
+for (const [g, n] of df) idf.set(g, Math.log(1 + (N - n + 0.5) / (n + 0.5)))
+
+function overlap(queryGrams, entry) {
+  const tf = entry.tf
+  let matched = 0, total = 0
+  for (const g of queryGrams) {
+    if (STOP.has(g)) continue
+    total += 1
+    if ((tf.get(g) || 0) > 0) matched += 1
+  }
+  return total === 0 ? 0 : matched / total
+}
+
+function bm25(queryGrams, entry) {
+  const tf = entry.tf
   let score = 0, matched = 0, total = 0
   for (const g of queryGrams) {
     if (STOP.has(g)) continue
@@ -59,49 +80,86 @@ function scoreEntry(queryGrams, entry) {
     score += (idf.get(g) || 1) * ((f * 2.2) / (f + 1.2))
   }
   const coverage = total === 0 ? 0 : matched / total
-  return { score: score / Math.sqrt(Math.max(1, entry.text.length)), coverage }
+  return { score: score / Math.sqrt(Math.max(1, entry.text.length)), coverage, matched }
 }
 
-function recall(query, topK = 3, minCoverage = 0.15) {
-  const qg = [...new Set(grams(query))]
-  if (!qg.length) return []
+function recallA(q, topK = 3) {
+  const qg = [...new Set(grams(q))]
+  const hits = entries.map((e) => ({ entry: e, score: overlap(qg, e) })).filter((h) => h.score > 0)
+  hits.sort((a, b) => b.score - a.score)
+  return hits.slice(0, topK)
+}
+
+function recallB(q, topK = 3) {
+  const qg = [...new Set(grams(q))]
   const hits = []
   for (const e of entries) {
-    const s = scoreEntry(qg, e)
+    const s = bm25(qg, e)
     if (s.score > 0) hits.push({ entry: e, ...s })
   }
   hits.sort((a, b) => b.score - a.score)
   if (!hits.length) return []
   const floor = Math.max(0.02, hits[0].score * 0.3)
-  return hits.filter((h) => h.score >= floor && h.coverage >= minCoverage).slice(0, topK)
+  return hits.filter((h) => h.score >= floor && h.coverage >= 0.2 && h.matched >= 2).slice(0, topK)
 }
 
-// 自动评测：用每个条目的标题（去掉 #）当 query，看能否召回自己
-function titleOf(e) {
-  const first = e.text.split('\n')[0] || ''
-  return first.replace(/^#+\s*/, '').trim()
+function recallC(q, topK = 3) {
+  const qg = [...new Set(grams(q))]
+  const cand = new Set()
+  for (const g of qg) {
+    const ids = gramIndex.get(g)
+    if (ids) for (const id of ids) cand.add(id)
+  }
+  const pool = cand.size ? [...cand].map((id) => byId.get(id)) : entries
+  const hits = []
+  for (const e of pool) {
+    const s = bm25(qg, e)
+    if (s.score > 0) hits.push({ entry: e, ...s })
+  }
+  hits.sort((a, b) => b.score - a.score)
+  if (!hits.length) return []
+  const floor = Math.max(0.02, hits[0].score * 0.3)
+  return hits.filter((h) => h.score >= floor && h.coverage >= 0.2 && h.matched >= 2).slice(0, topK)
 }
 
-let total = 0
-let hit1 = 0
-let hit3 = 0
-const misses = []
+const positives = entries
+  .map((e) => ({ q: (e.text.split('\n')[0] || '').replace(/^#+\s*/, '').trim(), expect: e.id }))
+  .filter((x) => x.q.length >= 3)
+const negatives = ['今天天气不错', '你吃了吗', '晚安', '哈哈', '在吗', '帮我订个外卖', '明天几点开会', '推荐部电影', '你几岁了', '无聊死了']
+const distractors = ['react useEffect 依赖数组', 'magpie 网关 429', 'electron 透明窗 置顶', 'pnpm overrides 版本错位', 'qqbot appid 沙箱']
 
-for (const e of entries) {
-  const q = titleOf(e)
-  if (q.length < 3) continue
-  total += 1
-  const r = recall(q, 3)
-  const ids = r.map((h) => h.entry.id)
-  if (ids[0] === e.id) hit1 += 1
-  if (ids.includes(e.id)) hit3 += 1
-  else misses.push({ id: e.id, q, got: ids })
+function evaluate(fn, name) {
+  let h1 = 0, h3 = 0
+  const t0 = Date.now()
+  for (const p of positives) {
+    const r = fn(p.q)
+    const ids = r.map((h) => h.entry.id)
+    if (ids[0] === p.expect) h1 += 1
+    if (ids.includes(p.expect)) h3 += 1
+  }
+  const ms = Date.now() - t0
+  let negHits = 0
+  const negDetail = []
+  for (const q of negatives) {
+    const r = fn(q)
+    if (r.length > 0) {
+      negHits += 1
+      negDetail.push(q + ' -> ' + r.map((h) => h.entry.id + ':' + h.score.toFixed(3)).join(','))
+    }
+  }
+  const distHits = distractors.map((q) => fn(q).length)
+  console.log(
+    name.padEnd(2),
+    '| rec@1', ((h1 / positives.length) * 100).toFixed(1) + '%',
+    '| rec@3', ((h3 / positives.length) * 100).toFixed(1) + '%',
+    '| 误召', negHits + '/' + negatives.length,
+    '| 干扰命中', JSON.stringify(distHits),
+    '|', ms + 'ms',
+  )
+  for (const d of negDetail) console.log('     ', d)
 }
 
-console.log('entries:', entries.length, 'evaluated:', total)
-console.log('recall@1:', (hit1 / total * 100).toFixed(1) + '%')
-console.log('recall@3:', (hit3 / total * 100).toFixed(1) + '%')
-console.log('misses:', misses.length)
-for (const m of misses.slice(0, 8)) {
-  console.log('  MISS', m.id, '| q=', m.q.slice(0, 30), '| got=', m.got.join(','))
-}
+console.log('entries:', entries.length, '| positives:', positives.length)
+evaluate(recallA, 'A')
+evaluate(recallB, 'B')
+evaluate(recallC, 'C')

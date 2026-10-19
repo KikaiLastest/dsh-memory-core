@@ -86,8 +86,7 @@ function buildIdf(entries) {
 }
 
 function scoreEntry(queryGrams, entry, idf) {
-  const tf = new Map()
-  for (const g of grams(entry.text)) tf.set(g, (tf.get(g) || 0) + 1)
+  const tf = entry.tf || new Map()
   let score = 0
   let matched = 0
   let total = 0
@@ -100,7 +99,7 @@ function scoreEntry(queryGrams, entry, idf) {
     score += (idf.get(g) || 1) * ((f * 2.2) / (f + 1.2))
   }
   const coverage = total === 0 ? 0 : matched / total
-  return { score: score / Math.sqrt(Math.max(1, entry.text.length)), coverage }
+  return { score: score / Math.sqrt(Math.max(1, entry.text.length)), coverage, matched }
 }
 
 let cache = { key: '', entries: [], idf: null }
@@ -128,27 +127,55 @@ function loadCached(cfg) {
   const key = cacheKey(cfg)
   if (cache.key === key) return cache
   const entries = loadEntries(cfg)
-  cache = { key, entries, idf: buildIdf(entries) }
+  const byId = new Map()
+  const gramIndex = new Map()
+  for (const entry of entries) {
+    const gs = grams(entry.text)
+    const tf = new Map()
+    for (const g of gs) tf.set(g, (tf.get(g) || 0) + 1)
+    entry.tf = tf
+    byId.set(entry.id, entry)
+    for (const g of new Set(gs)) {
+      let set = gramIndex.get(g)
+      if (set === undefined) {
+        set = new Set()
+        gramIndex.set(g, set)
+      }
+      set.add(entry.id)
+    }
+  }
+  cache = { key, entries, idf: buildIdf(entries), byId, gramIndex }
   return cache
 }
 
 function recall(cfg, query) {
   const qg = [...new Set(grams(query))]
   if (qg.length === 0) return []
-  const { entries, idf } = loadCached(cfg)
+  const { entries, idf, byId, gramIndex } = loadCached(cfg)
   if (entries.length === 0) return []
+  const candidates = new Set()
+  for (const g of qg) {
+    const ids = gramIndex.get(g)
+    if (ids === undefined) continue
+    for (const id of ids) candidates.add(id)
+  }
+  const pool =
+    candidates.size === 0
+      ? entries
+      : [...candidates].map((id) => byId.get(id)).filter(Boolean)
   const hits = []
-  for (const entry of entries) {
+  for (const entry of pool) {
     const s = scoreEntry(qg, entry, idf)
-    if (s.score > 0) hits.push({ entry, score: s.score, coverage: s.coverage })
+    if (s.score > 0) hits.push({ entry, score: s.score, coverage: s.coverage, matched: s.matched })
   }
   hits.sort((a, b) => b.score - a.score)
   const top = hits[0]
   if (!top) return []
   const floor = Math.max(cfg.minScore || 0.02, top.score * (cfg.minRatio || 0.3))
   const minCoverage = cfg.minCoverage || 0.2
+  const minMatched = cfg.minMatched || 2
   return hits
-    .filter((h) => h.score >= floor && h.coverage >= minCoverage)
+    .filter((h) => h.score >= floor && h.coverage >= minCoverage && h.matched >= minMatched)
     .slice(0, cfg.topK)
 }
 
@@ -237,6 +264,7 @@ export function apply(ctx, config = {}) {
     minRatio: config.minRatio || 0.3,
     minScore: config.minScore || 0.02,
     minCoverage: config.minCoverage || 0.2,
+    minMatched: config.minMatched || 2,
     stateFile: config.stateFile || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'affect', 'state.json'),
     enableStable: config.enableStable !== false,
   }
