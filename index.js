@@ -389,7 +389,8 @@ export function apply(ctx, config = {}) {
         const decision = await next()
         try {
           if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
-          if (payload && payload.step !== undefined && payload.step !== 1) return decision
+          // 只拦后续步骤：DSH 的 step 可能从 0 也能从 1 开始，用 >1 更稳
+          if (payload && payload.step !== undefined && payload.step > 1) return decision
 
           const lastUser = [...decision.messages]
             .reverse()
