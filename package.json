@@ -1,11 +1,19 @@
 {
   "name": "dsh-memory-core",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Memory recall + affect state for DeepSeek Harness: BM25-lite recall with source markers, consolidation to structured memory, and a two-scalar affect state.",
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.js",
+    "client.js",
+    "config.mjs",
     "affect.mjs",
     "decay.mjs",
     "autocapture.mjs",
@@ -41,10 +49,21 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "slots",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "external": [
+        "react"
+      ]
     }
   },
   "scripts": {
-    "test": "node test/selftest.mjs && node test/affect.test.mjs && node test/eval.mjs && node test/decay-autocapture.test.mjs",
+    "test": "node test/selftest.mjs && node test/affect.test.mjs && node test/eval.mjs && node test/decay-autocapture.test.mjs && node test/config-schema.test.mjs && node test/panel-routes.test.mjs && node test/client-smoke.test.mjs",
     "consolidate": "node consolidate.mjs"
   }
 }

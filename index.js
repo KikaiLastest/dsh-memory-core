@@ -5,13 +5,24 @@ import crypto from 'node:crypto'
 import { classify, applyEvent, decay, loadState, saveState, toneHint } from './affect.mjs'
 import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
 import { autoCapture, readCaptureStore } from './autocapture.mjs'
+import {
+  fieldDescriptors,
+  groupDescriptors,
+  normalizeConfig,
+  validatePatch,
+} from './config.mjs'
 
 export const name = 'dsh-memory-core'
 export const inject = ['systemPrompt']
 
-const DEFAULT_MEMORY = 'D:\\dsh-workspace\\memory'
-const DEFAULT_DIALOGUE = 'D:\\dsh-workspace\\对话记录.md'
-const DEFAULT_LOG = 'D:\\dsh-workspace\\impl-a\\recall.log'
+const DEFAULT_LOG = path.join(
+  process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
+  'recall.log'
+)
+
+// 设置面板的两条路由（同一路径不能既接 GET 又接 POST —— 路由按 (kind, path) 去重）
+const ROUTE_STATE = '/dsh-memory-core/config'
+const ROUTE_SAVE = '/dsh-memory-core/config/save'
 const DEFAULT_AUTOCAPTURE_STORE = path.join(
   process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
   'autocapture',
@@ -220,7 +231,7 @@ function recall(cfg, query) {
       : [...candidates].map((id) => byId.get(id)).filter(Boolean)
   const hits = []
   const now = Date.now()
-  const halfLife = cfg.halfLifeDays || 30
+  const halfLife = cfg.halfLifeDays ?? 30
   for (const entry of pool) {
     const s = scoreEntry(qg, entry, idf, now, halfLife)
     if (s.score > 0) {
@@ -238,8 +249,9 @@ function recall(cfg, query) {
   const top = hits[0]
   if (!top) return []
   const floor = Math.max(cfg.minScore || 0.02, top.score * (cfg.minRatio || 0.3))
-  const minCoverage = cfg.minCoverage || 0.2
-  const minMatched = cfg.minMatched || 2
+  // 用 ?? 而不是 ||：minCoverage 允许调到 0（只要命中就算），|| 会把 0 悄悄换成默认值
+  const minCoverage = cfg.minCoverage ?? 0.2
+  const minMatched = cfg.minMatched ?? 2
   return hits
     .filter((h) => h.score >= floor && h.coverage >= minCoverage && h.matched >= minMatched)
     .slice(0, cfg.topK)
@@ -292,6 +304,9 @@ function makeRecallMessage(text) {
 
 function appendLog(file, record) {
   try {
+    if (!file) return
+    const dir = path.dirname(file)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
     fs.appendFileSync(file, JSON.stringify(record) + '\n', 'utf8')
   } catch {
     /* logging is best-effort */
@@ -323,57 +338,220 @@ function textOf(message) {
 }
 
 export function apply(ctx, config = {}) {
+  // 面板上的那 10 个参数统一走 config.mjs：默认值 + 范围夹取（0 是合法值，不会被 || 吃掉）。
+  // 其余内部路径（日志、捕获存档、affect 状态）仍然只在 cordis.patch.yml 里改。
   const cfg = {
-    memoryRoot: config.memoryRoot || DEFAULT_MEMORY,
-    dialogueFile: config.dialogueFile || DEFAULT_DIALOGUE,
+    ...normalizeConfig(config),
     logFile: config.logFile || DEFAULT_LOG,
     autocaptureStore: config.autocaptureStore || DEFAULT_AUTOCAPTURE_STORE,
-    dailyQuota: config.dailyQuota || 10,
-    halfLifeDays: config.halfLifeDays || 30,
-    enableAutoCapture: config.enableAutoCapture !== false,
-    topK: config.topK || 3,
-    timeoutMs: config.timeoutMs || 150,
-    minRatio: config.minRatio || 0.3,
-    minScore: config.minScore || 0.02,
-    minCoverage: config.minCoverage || 0.2,
-    minMatched: config.minMatched || 2,
+    minRatio: typeof config.minRatio === 'number' && config.minRatio > 0 ? config.minRatio : 0.3,
+    minScore: typeof config.minScore === 'number' && config.minScore > 0 ? config.minScore : 0.02,
     stateFile: config.stateFile || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'affect', 'state.json'),
-    enableStable: config.enableStable !== false,
   }
 
-  // P0a: 只放“记忆边界 + 硬规矩”，不重复 AGENTS.md 的身份段
-  if (cfg.enableStable) {
+  // 常驻段可以随时开关：面板上切了「注入常驻规则段」不必等插件重载。
+  // promptCtx 在 systemPrompt 注入回调里拿到，mountStable 只在那之后才真的挂。
+  let promptCtx = null
+  let stableDispose = null
+
+  const mountStable = () => {
+    if (!cfg.enableStable || stableDispose !== null) return
+    const c = promptCtx
+    if (!c || !c.systemPrompt || typeof c.systemPrompt.section !== 'function') return
     try {
-      ctx.inject(['systemPrompt'], (c) => {
-        if (!c.systemPrompt || typeof c.systemPrompt.section !== 'function') return
-        c.systemPrompt.section({
-          name: 'dsh-memory-core:stable',
-          order: 900,
-          interpolate: false,
-          text: () => buildStable(),
-        })
+      const dispose = c.systemPrompt.section({
+        name: 'dsh-memory-core:stable',
+        order: 900,
+        interpolate: false,
+        text: () => buildStable(),
       })
+      // 正常情况下 section() 返回 disposer；万一没有，用 true 占位表示「已经挂上了」
+      stableDispose = typeof dispose === 'function' ? dispose : true
     } catch {
-      /* best-effort */
+      stableDispose = null
     }
   }
 
-  // P2: affect tone hint（只接 systemPrompt 一个消费者）
+  const unmountStable = () => {
+    if (stableDispose === null) return
+    const dispose = stableDispose
+    stableDispose = null
+    if (typeof dispose !== 'function') return
+    try {
+      dispose()
+    } catch {
+      /* 已经跟着注入上下文一起没了 */
+    }
+  }
+
+  const syncStable = () => {
+    if (cfg.enableStable) mountStable()
+    else unmountStable()
+  }
+
+  // ── 设置面板的读写 ──────────────────────────────────────────────────────
+  // 读：把「当前生效值 + 参数表」一起给出去，面板照着表渲染（不重复写死一份中文标签）。
+  // 写：先严格校验，再经 ctx.configEditor.edit() 落进 profile 的 patch 层 ——
+  //     那是 DSH 自己的配置机制（YAML 注释和 !!js 都由它保着），重启后仍然是新值。
+  //     保存同时就地更新 cfg，所以下一轮召回立刻按新参数走，不等 Loader 重载。
+  try {
+    ctx.inject(['webServer'], (panelCtx) => {
+      const webServer = panelCtx.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+
+      const snapshot = () => normalizeConfig(cfg)
+
+      const reply = (res, body) => {
+        try {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify(body))
+        } catch {
+          /* 页面已经关了就算了 */
+        }
+      }
+
+      const readBody = async (req) => {
+        let text = ''
+        for await (const chunk of req) text += chunk
+        if (!text) return {}
+        return JSON.parse(text)
+      }
+
+      const editorOf = () => {
+        try {
+          const editor = typeof panelCtx.get === 'function' ? panelCtx.get('configEditor') : undefined
+          return editor && typeof editor.edit === 'function' ? editor : undefined
+        } catch {
+          return undefined
+        }
+      }
+
+      // 自己的那一行：优先取本插件 fiber 的 entry，取不到再按包名在 profile 行里找。
+      const ownEntry = (editor) => {
+        try {
+          const fiberEntry = ctx.fiber && ctx.fiber.entry
+          if (fiberEntry && fiberEntry.options && fiberEntry.options.name === name) return fiberEntry
+          const list = typeof editor.entries === 'function' ? editor.entries() : []
+          for (const entry of list || []) {
+            if (entry && entry.options && entry.options.name === name) return entry
+          }
+          return fiberEntry
+        } catch {
+          return undefined
+        }
+      }
+
+      // 路由 (kind, path) 重复注册会抛错；重载竞态下宁可少一个面板，也不要整行加载失败。
+      const route = (path, handler) => {
+        try {
+          ctx.effect(() => webServer.register({ kind: 'exact', path, handler }))
+        } catch (error) {
+          try {
+            ctx.logger?.warn?.(`dsh-memory-core: 设置路由 ${path} 没挂上（${String((error && error.message) || error)}）`)
+          } catch {
+            /* best-effort */
+          }
+        }
+      }
+
+      route(ROUTE_STATE, async (req, res) => {
+        reply(res, {
+          ok: true,
+          config: snapshot(),
+          fields: fieldDescriptors(),
+          groups: groupDescriptors(),
+          editable: editorOf() !== undefined,
+        })
+      })
+
+      route(ROUTE_SAVE, async (req, res) => {
+        let body
+        try {
+          body = await readBody(req)
+        } catch {
+          reply(res, { ok: false, errors: { _: '请求体不是合法 JSON' }, config: snapshot() })
+          return
+        }
+        const incoming =
+          body && typeof body === 'object' && body.config && typeof body.config === 'object' ? body.config : body
+        const checked = validatePatch(incoming)
+        if (!checked.ok) {
+          reply(res, { ok: false, errors: checked.errors, config: snapshot() })
+          return
+        }
+
+        Object.assign(cfg, checked.values)
+        syncStable()
+
+        const editor = editorOf()
+        if (editor === undefined) {
+          reply(res, {
+            ok: false,
+            persisted: false,
+            errors: {},
+            config: snapshot(),
+            message: '这个部署没有 configEditor：改动本次运行立刻生效，但存不进配置文件（重启后回到旧值）',
+          })
+          return
+        }
+
+        const entry = ownEntry(editor)
+        if (entry === undefined) {
+          reply(res, {
+            ok: false,
+            persisted: false,
+            errors: {},
+            config: snapshot(),
+            message: '找不到本插件在 profile 里的配置行，改动只在本次运行生效',
+          })
+          return
+        }
+
+        try {
+          await editor.edit(entry, (current) => ({
+            ...(current && typeof current === 'object' ? current : {}),
+            ...checked.values,
+          }))
+          reply(res, { ok: true, persisted: true, errors: {}, config: snapshot(), message: '已保存' })
+        } catch (error) {
+          reply(res, {
+            ok: false,
+            persisted: false,
+            errors: {},
+            config: snapshot(),
+            message: '写配置失败：' + String((error && error.message) || error),
+          })
+        }
+      })
+    })
+  } catch {
+    /* 没有 webServer 的部署（headless）就不挂面板路由，召回照旧 */
+  }
+
+
+  // P0a + P2: 只放“记忆边界 + 硬规矩”和 affect 语气提示，不重复 AGENTS.md 的身份段。
+  // 一个注入上下文就够：常驻段挂不挂由 syncStable() 现场决定（面板开关立刻生效，不等重载）。
   try {
     ctx.inject(['systemPrompt'], (c) => {
-      if (!c.systemPrompt || typeof c.systemPrompt.section !== 'function') return
-      c.systemPrompt.section({
-        name: 'dsh-memory-core:affect',
-        order: 1100,
-        interpolate: false,
-        text: () => {
-          try {
-            return toneHint(decay(loadState(cfg.stateFile)))
-          } catch {
-            return ''
-          }
-        },
-      })
+      if (!c || !c.systemPrompt || typeof c.systemPrompt.section !== 'function') return
+      promptCtx = c
+      try {
+        c.systemPrompt.section({
+          name: 'dsh-memory-core:affect',
+          order: 1100,
+          interpolate: false,
+          text: () => {
+            try {
+              return toneHint(decay(loadState(cfg.stateFile)))
+            } catch {
+              return ''
+            }
+          },
+        })
+      } catch {
+        /* best-effort */
+      }
+      mountStable()
     })
   } catch {
     /* best-effort */
@@ -428,7 +606,10 @@ export function apply(ctx, config = {}) {
             }
           }
 
-          if (query.trim().length < 2) return decision
+          if (query.trim().length < 2) {
+            appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: [], ms: 0, injected: false, reason: 'too_short' })
+            return decision
+          }
           const started = Date.now()
           const hits = await withTimeout(
             Promise.resolve().then(() => recall(cfg, query)),

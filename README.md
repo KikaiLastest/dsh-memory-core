@@ -69,14 +69,38 @@ dsh plugin --profile <你的 profile> add file:<这个目录>
         enableStable: true
 ```
 
+## 设置面板（0.2.0）
+
+DSH 设置页左侧多一节 **「记忆核心」**（客户端 slot `settings.section`，`id: memory-core`，`order: 58`）。面板只做两件事：读当前生效值、把改动存回配置。
+
+| 参数 | 类型 | 默认 | 范围 | 说明 |
+|---|---|---|---|---|
+| `memoryRoot` | 路径 | `D:\dsh-workspace\memory` | 非空 | 日记 / 生长记录所在根目录（只读） |
+| `dialogueFile` | 路径 | `D:\dsh-workspace\对话记录.md` | 非空 | 当语料读的对话记录 |
+| `topK` | 数字 | 3 | 1–10 | 每次注入几条 |
+| `timeoutMs` | 数字 | 150 | 50–1000 | 召回超时（毫秒） |
+| `minCoverage` | 数字 | 0.2 | 0–1 | 查询 2-gram 覆盖率下限（0 = 不设门槛） |
+| `minMatched` | 数字 | 2 | 1–5 | 最少命中片段数 |
+| `halfLifeDays` | 数字 | 30 | 1–365 | 权重半衰期（天） |
+| `dailyQuota` | 数字 | 10 | 0–100 | 自动捕获每日配额（0 = 不写） |
+| `enableStable` | 开关 | 开 | — | 是否注入常驻「记忆使用协议」 |
+| `enableAutoCapture` | 开关 | 开 | — | 是否开启自动捕获 |
+
+保存链路：客户端 `POST /dsh-memory-core/config/save` → `config.mjs` 严格校验（越界 / 类型错直接点名，不偷偷改值）→ **`ctx.configEditor.edit()`** 写进 profile 的 patch 层（宿主自己的配置机制：保留 YAML 注释与 `!!js`，重启后仍在）→ 同时就地更新运行中的配置，下一轮召回立刻按新值走。
+
+- 参数表只写在 `config.mjs` 一张表里，客户端从 `GET /dsh-memory-core/config` 拿表渲染，不重复写死中文标签。
+- 部署里没有 `configEditor`（如 headless）时：改动当次生效，面板会明说「存不进配置文件」。
+- 日志路径 / 捕获存档路径 / affect 状态文件仍然只在 `cordis.patch.yml` 里改。
+
 ## 测试
 
 ```bash
-npm test                 # selftest + affect 单测 + 召回评测
+npm test                 # selftest + affect 单测 + 召回评测 + 参数校验 + 面板路由
 npm run consolidate      # 跑一次固化（幂等）
 ```
 
 `selftest` 用 mock 宿主验证：section 注册、注入前缀、不相关查询不注入、情感状态变化、日志写入。
+`test/panel-routes.test.mjs` 用假 ctx / webServer / configEditor 跑一遍读写路由：校验拒绝、落盘调用、0 值保留、headless 降级。
 
 ## 已知限制
 

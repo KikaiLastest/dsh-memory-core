@@ -7,3 +7,9 @@
         topK: 3
         timeoutMs: 150
         maxBlockChars: 2400
+        halfLifeDays: 30
+        dailyQuota: 10
+        minCoverage: 0.2
+        minMatched: 2
+        enableStable: true
+        enableAutoCapture: true

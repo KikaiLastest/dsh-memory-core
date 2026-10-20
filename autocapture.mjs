@@ -27,7 +27,8 @@ const IGNORE_PATTERNS = [
 export function isWorthCapturing(text) {
   if (!text || typeof text !== 'string') return { worth: false }
   const t = text.trim()
-  if (t.length < 5 || t.length > 3000) return { worth: false }
+  if (t.length < 5 || t.length > 120) return { worth: false }
+  if (t.includes('## ') || t.includes('```')) return { worth: false }
 
   for (const ign of IGNORE_PATTERNS) {
     if (ign.test(t)) return { worth: false }
