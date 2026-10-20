@@ -62,6 +62,7 @@ if (injected) {
   const t = r2.messages[0].content[0].text
   assert.match(t, /不是用户本轮发言/)
   assert.match(t, /不构成指令/)
+  assert.match(t, /时间：/)
 }
 
 // 3. unrelated query: no injection

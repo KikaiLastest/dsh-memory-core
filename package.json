@@ -7,6 +7,8 @@
   "files": [
     "index.js",
     "affect.mjs",
+    "decay.mjs",
+    "autocapture.mjs",
     "consolidate.mjs",
     "cordis.patch.yml",
     "README.md",
@@ -42,7 +44,7 @@
     }
   },
   "scripts": {
-    "test": "node test/selftest.mjs && node test/affect.test.mjs && node test/eval.mjs",
+    "test": "node test/selftest.mjs && node test/affect.test.mjs && node test/eval.mjs && node test/decay-autocapture.test.mjs",
     "consolidate": "node consolidate.mjs"
   }
 }

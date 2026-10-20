@@ -3,6 +3,8 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { classify, applyEvent, decay, loadState, saveState, toneHint } from './affect.mjs'
+import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
+import { autoCapture, readCaptureStore } from './autocapture.mjs'
 
 export const name = 'dsh-memory-core'
 export const inject = ['systemPrompt']
@@ -10,6 +12,11 @@ export const inject = ['systemPrompt']
 const DEFAULT_MEMORY = 'D:\\dsh-workspace\\memory'
 const DEFAULT_DIALOGUE = 'D:\\dsh-workspace\\对话记录.md'
 const DEFAULT_LOG = 'D:\\dsh-workspace\\impl-a\\recall.log'
+const DEFAULT_AUTOCAPTURE_STORE = path.join(
+  process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
+  'autocapture',
+  'captures.jsonl'
+)
 
 const STOP = new Set([
   '用户', '我的', '什么', '怎么', '这个', '那个', '就是', '还是', '可以', '已经',
@@ -44,7 +51,7 @@ function grams(s) {
 }
 
 /** 按 Markdown 小节切条目；跳过标题行与元信息表。 */
-function splitEntries(text, src) {
+function splitEntries(text, src, fileMtimeMs = null) {
   const out = []
   const parts = text.split(/\n(?=#{2,3} )/)
   let line = 1
@@ -52,7 +59,24 @@ function splitEntries(text, src) {
     const t = part.trim()
     const advance = part.split('\n').length
     if (t.length >= 40 && !/^\|/.test(t.split('\n')[1] || '')) {
-      out.push({ id: src + ':' + line, src, line, text: t })
+      // 提取日期：从第 1-2 行找形如 2026-10-20 的日期
+      let createdAt = null
+      const dateMatch = t.match(/\b(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\b/)
+      if (dateMatch) {
+        createdAt = dateMatch[1].replace(/[/.]/g, '-')
+      } else if (fileMtimeMs) {
+        createdAt = new Date(fileMtimeMs).toISOString().slice(0, 10)
+      }
+      out.push({
+        id: src + ':' + line,
+        src,
+        line,
+        text: t,
+        weight: 1.0,
+        createdAt,
+        created_at: createdAt,
+        permanent: false,
+      })
     }
     line += advance
   }
@@ -69,8 +93,32 @@ function loadEntries(cfg) {
   const entries = []
   for (const [src, file] of sources) {
     if (!file) continue
-    entries.push(...splitEntries(readText(file), src))
+    let mtime = null
+    try {
+      mtime = fs.statSync(file).mtimeMs
+    } catch {}
+    entries.push(...splitEntries(readText(file), src, mtime))
   }
+
+  // 同时也读取 autocapture 独立文件中的记忆记录（如有）
+  if (cfg.autocaptureStore && fs.existsSync(cfg.autocaptureStore)) {
+    const captured = readCaptureStore(cfg.autocaptureStore)
+    for (const c of captured) {
+      if (c && c.text && c.text.length >= 5) {
+        entries.push({
+          id: c.id || ('captured:' + crypto.createHash('sha1').update(c.text).digest('hex').slice(0, 8)),
+          src: c.source || 'autocapture',
+          line: 0,
+          text: c.text,
+          weight: c.weight !== undefined ? c.weight : 1.0,
+          createdAt: c.created_at || c.createdAt || null,
+          created_at: c.created_at || c.createdAt || null,
+          permanent: Boolean(c.permanent),
+        })
+      }
+    }
+  }
+
   return entries
 }
 
@@ -85,7 +133,7 @@ function buildIdf(entries) {
   return idf
 }
 
-function scoreEntry(queryGrams, entry, idf) {
+function scoreEntry(queryGrams, entry, idf, now = Date.now(), halfLifeDays = 30) {
   const tf = entry.tf || new Map()
   let score = 0
   let matched = 0
@@ -99,7 +147,12 @@ function scoreEntry(queryGrams, entry, idf) {
     score += (idf.get(g) || 1) * ((f * 2.2) / (f + 1.2))
   }
   const coverage = total === 0 ? 0 : matched / total
-  return { score: score / Math.sqrt(Math.max(1, entry.text.length)), coverage, matched }
+  const rawScore = score / Math.sqrt(Math.max(1, entry.text.length))
+
+  // 权重半衰期衰减计算，参与排序但不删除
+  const { finalScore, weight } = applyScoreDecay(rawScore, entry, now, halfLifeDays)
+
+  return { score: finalScore, rawScore, weight, coverage, matched }
 }
 
 let cache = { key: '', entries: [], idf: null }
@@ -110,7 +163,9 @@ function cacheKey(cfg) {
     path.join(cfg.memoryRoot, '日记.md'),
     path.join(cfg.memoryRoot, '生长', '状态.md'),
     path.join(cfg.memoryRoot, '生长', '生长记录.md'),
-  ]
+    cfg.autocaptureStore,
+  ].filter(Boolean)
+
   return files
     .map((f) => {
       try {
@@ -164,9 +219,20 @@ function recall(cfg, query) {
       ? entries
       : [...candidates].map((id) => byId.get(id)).filter(Boolean)
   const hits = []
+  const now = Date.now()
+  const halfLife = cfg.halfLifeDays || 30
   for (const entry of pool) {
-    const s = scoreEntry(qg, entry, idf)
-    if (s.score > 0) hits.push({ entry, score: s.score, coverage: s.coverage, matched: s.matched })
+    const s = scoreEntry(qg, entry, idf, now, halfLife)
+    if (s.score > 0) {
+      hits.push({
+        entry,
+        score: s.score,
+        rawScore: s.rawScore,
+        weight: s.weight,
+        coverage: s.coverage,
+        matched: s.matched,
+      })
+    }
   }
   hits.sort((a, b) => b.score - a.score)
   const top = hits[0]
@@ -185,7 +251,9 @@ function buildBlock(hits) {
     '',
   ]
   for (const h of hits) {
-    lines.push('[memory-recall] 来源：' + h.entry.src + ' 行 ' + h.entry.line)
+    const lineTag = h.entry.line ? ' 行 ' + h.entry.line : ''
+    const timeTag = h.entry.createdAt || h.entry.created_at ? ' | 时间：' + (h.entry.createdAt || h.entry.created_at) : ''
+    lines.push('[memory-recall] 来源：' + h.entry.src + lineTag + timeTag)
     lines.push(h.entry.text.replace(/<\/memory-recall>/gi, '&lt;/memory-recall&gt;'))
     lines.push('')
   }
@@ -259,6 +327,10 @@ export function apply(ctx, config = {}) {
     memoryRoot: config.memoryRoot || DEFAULT_MEMORY,
     dialogueFile: config.dialogueFile || DEFAULT_DIALOGUE,
     logFile: config.logFile || DEFAULT_LOG,
+    autocaptureStore: config.autocaptureStore || DEFAULT_AUTOCAPTURE_STORE,
+    dailyQuota: config.dailyQuota || 10,
+    halfLifeDays: config.halfLifeDays || 30,
+    enableAutoCapture: config.enableAutoCapture !== false,
     topK: config.topK || 3,
     timeoutMs: config.timeoutMs || 150,
     minRatio: config.minRatio || 0.3,
@@ -337,6 +409,22 @@ export function apply(ctx, config = {}) {
             }
           } catch {
             /* best-effort */
+          }
+
+          // 自动筛选重要条目并捕获到独立存储（带每日配额控制）
+          if (cfg.enableAutoCapture && cfg.autocaptureStore) {
+            try {
+              autoCapture({
+                text: query,
+                storePath: cfg.autocaptureStore,
+                dailyQuota: cfg.dailyQuota,
+                initialWeight: 1.0,
+                permanent: false,
+                source: 'dialogue',
+              })
+            } catch {
+              /* best-effort */
+            }
           }
 
           if (query.trim().length < 2) return decision
