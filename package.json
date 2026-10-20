@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Memory recall + affect state for DeepSeek Harness: BM25-lite recall with source markers, consolidation to structured memory, and a two-scalar affect state.",
   "type": "module",
   "main": "index.js",

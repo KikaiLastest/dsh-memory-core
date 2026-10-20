@@ -1,6 +1,6 @@
 - insert:
-    - id: dsh-memory-core-a
-      name: dsh-memory-core-a
+    - id: dsh-memory-core
+      name: dsh-memory-core
       config:
         memoryRoot: "D:\\dsh-workspace\\memory"
         dialogueFile: "D:\\dsh-workspace\\对话记录.md"

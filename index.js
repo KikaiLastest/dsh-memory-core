@@ -4,7 +4,7 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { classify, applyEvent, decay, loadState, saveState, toneHint } from './affect.mjs'
 
-export const name = 'dsh-memory-core-a'
+export const name = 'dsh-memory-core'
 export const inject = ['systemPrompt']
 
 const DEFAULT_MEMORY = 'D:\\dsh-workspace\\memory'
@@ -275,7 +275,7 @@ export function apply(ctx, config = {}) {
       ctx.inject(['systemPrompt'], (c) => {
         if (!c.systemPrompt || typeof c.systemPrompt.section !== 'function') return
         c.systemPrompt.section({
-          name: 'dsh-memory-core-a:stable',
+          name: 'dsh-memory-core:stable',
           order: 900,
           interpolate: false,
           text: () => buildStable(),
@@ -291,7 +291,7 @@ export function apply(ctx, config = {}) {
     ctx.inject(['systemPrompt'], (c) => {
       if (!c.systemPrompt || typeof c.systemPrompt.section !== 'function') return
       c.systemPrompt.section({
-        name: 'dsh-memory-core-a:affect',
+        name: 'dsh-memory-core:affect',
         order: 1100,
         interpolate: false,
         text: () => {
