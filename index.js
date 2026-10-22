@@ -199,7 +199,11 @@ function buildModel(entries) {
   let totalLen = 0
   for (const e of entries) {
     totalLen += e.text.length
-    for (const g of new Set(grams(e.text))) df.set(g, (df.get(g) || 0) + 1)
+    // 建倒排时已经算过每条文本的 tf，直接拿它的键统计文档频率。
+    // 这里再调一次 grams(e.text) 等于把整个语料重新过一遍。
+    for (const g of e.tf ? e.tf.keys() : new Set(grams(e.text))) {
+      df.set(g, (df.get(g) || 0) + 1)
+    }
   }
   const N = Math.max(1, entries.length)
   const idf = new Map()
@@ -304,19 +308,30 @@ function loadCached(cfg) {
   const byId = new Map()
   const gramIndex = new Map()
   for (const entry of recallable) {
-    const gs = grams(entry.text)
     const tf = new Map()
-    for (const g of gs) tf.set(g, (tf.get(g) || 0) + 1)
-    entry.tf = tf
-    byId.set(entry.id, entry)
-    for (const g of new Set(gs)) {
-      let set = gramIndex.get(g)
-      if (set === undefined) {
-        set = new Set()
-        gramIndex.set(g, set)
+    // 一遍扫完：同时累计词频和建倒排。
+    // 以前先 grams() 生成数组、再遍历建 tf、再 new Set 去重建倒排，
+    // 同一条文本被完整走了三遍，157 条语料上这就是冷启动的主要开销。
+    // 这里顺便把 grams() 内联掉，省掉每条文本一个 500 元素的中间数组。
+    const text = norm(entry.text)
+    for (let i = 0; i < text.length - 1; i += 1) {
+      const g = text.slice(i, i + 2)
+      const n = tf.get(g)
+      if (n === undefined) {
+        tf.set(g, 1)
+        let set = gramIndex.get(g)
+        if (set === undefined) {
+          set = new Set()
+          gramIndex.set(g, set)
+        }
+        set.add(entry.id)
+      } else {
+        tf.set(g, n + 1)
       }
-      set.add(entry.id)
     }
+    entry.tf = tf
+    entry.len = text.length
+    byId.set(entry.id, entry)
   }
   cache = { key, entries: recallable, model: buildModel(recallable), byId, gramIndex, suppressed, idDrift }
   return cache
