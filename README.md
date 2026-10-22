@@ -143,6 +143,8 @@ DSH 设置页左侧多一节 **「记忆核心」**（客户端 slot `settings.s
 ```bash
 npm test                 # selftest + affect + 脱敏 + 导航/摘要 + 召回评测 + 参数校验 + 面板路由
 npm run consolidate      # 跑一次固化（幂等）
+
+固化脚本也接受环境变量，换机器不用改源码：`DSH_MEMORY_DIALOGUE`（对话文件）、`DSH_MEMORY_ROOT`（档案根）、`DSH_MEMORY_STRUCTURED` / `DSH_MEMORY_WATERMARK`（覆盖输出与水位）。都不设时从当前目录往上找「对话记录.md」，找不到直接报错，不会静默当成空对话跑完。
 ```
 
 `selftest` 用 mock 宿主验证：section 注册、注入前缀、不相关查询不注入、情感状态变化、日志写入。

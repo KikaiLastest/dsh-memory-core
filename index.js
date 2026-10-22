@@ -371,7 +371,7 @@ export function apply(ctx, config = {}) {
   const syncSummarizer = () => {
     stopSummarizer()
     if (!cfg.enableSummary) return
-    const minutes = Math.max(1, Math.min(1440, Math.floor(Number(cfg.summarizeIntervalMinutes) || 10)))
+    const minutes = Math.max(1, Math.min(1440, Math.floor(Number(cfg.summarizeIntervalMinutes) ?? 10)))
     summarizeTimer = setInterval(() => {
       try {
         summarizeDialogue(cfg)
@@ -611,7 +611,12 @@ export function apply(ctx, config = {}) {
   }
 
   // P0b: 按需召回，注入前置
+  //
+  // seen 只用来挡「同一条查询在同一轮里被多次 pre-step 重复注入」，
+  // 所以键里必须带上查询本身：只拿命中 ID 列表当键的话，两个意图不同但碰巧
+  // 命中同一批记忆的查询，第二个会被永久跳过。上限 200 条，防止长期运行无界增长。
   const seen = new Set()
+  const SEEN_LIMIT = 200
 
   try {
     ctx.on(
@@ -672,13 +677,14 @@ export function apply(ctx, config = {}) {
             return decision
           }
 
-          const key = hits.map((h) => h.entry.id).join('|')
+          const key = query.slice(0, 120) + '|' + hits.map((h) => h.entry.id).join('|')
           const scored = hits.map((h) => h.entry.id + ':' + h.score.toFixed(3) + ':c' + h.coverage.toFixed(2))
           if (seen.has(key)) {
             appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: scored, ms, injected: false, reason: 'dedup' })
             return decision
           }
           seen.add(key)
+          if (seen.size > SEEN_LIMIT) seen.delete(seen.values().next().value)
 
           const text = buildBlock(hits)
           appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: scored, ms, injected: true })
