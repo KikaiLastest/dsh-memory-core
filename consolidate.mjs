@@ -2,6 +2,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
+import { idOf } from './status.mjs'
+
+export { idOf }
 
 function readText(f) {
   try {
@@ -41,10 +44,6 @@ export function sections(text) {
     line += adv
   }
   return out
-}
-
-export function idOf(text) {
-  return 'mem-' + crypto.createHash('sha1').update(text).digest('hex').slice(0, 12)
 }
 
 /**

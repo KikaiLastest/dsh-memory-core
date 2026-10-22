@@ -6,7 +6,7 @@ import { classify, applyEvent, decay, loadState, saveState, toneHint } from './a
 import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
 import { autoCapture, readCaptureStore } from './autocapture.mjs'
 import { buildNav, summarizeDialogue } from './summary.mjs'
-import { idOf } from './consolidate.mjs'
+import { idOf, loadStatusMap, isRecallable } from './status.mjs'
 import {
   fieldDescriptors,
   groupDescriptors,
@@ -184,52 +184,6 @@ let cache = { key: '', entries: [], idf: null }
  * 关系优先于状态字段：即使某条记录自己写着 active，只要被别的记录 supersedes 指到，
  * 就当它已被取代 —— 手动改状态时漏掉一半，是这类系统最常见的坏数据。
  */
-function loadStatusMap(cfg) {
-  const bySourceId = new Map()
-  const byContentId = new Map()
-  const file = cfg.structuredFile
-  if (!file) return { bySourceId, byContentId }
-  const text = readText(file)
-  if (!text) return { bySourceId, byContentId }
-
-  const byMemId = new Map()
-  const records = []
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue
-    let rec
-    try {
-      rec = JSON.parse(line)
-    } catch {
-      continue // 单行损坏不该让整张状态表失效
-    }
-    if (!rec || !rec.source_id) continue
-    const status = typeof rec.status === 'string' ? rec.status : null
-    records.push({ rec, status })
-    byMemId.set(rec.id, rec)
-    bySourceId.set(rec.source_id, status)
-    // 内容身份用完整文本的哈希（和 consolidate 的 idOf 同一套算法），
-    // 不要用 quote 前缀算 —— quote 是 s.text 的 200 字截断，
-    // 先去空白再截和先截再去空白结果不同，长文本会直接对不上。
-    if (rec.id) byContentId.set(rec.id, status)
-  }
-
-  // 第二遍才有完整 byMemId，supersedes 可能指向后面才出现的记录
-  for (const { rec } of records) {
-    if (!rec.supersedes) continue
-    const target = byMemId.get(rec.supersedes)
-    if (!target) continue
-    if (target.source_id) bySourceId.set(target.source_id, 'superseded')
-    if (target.id) byContentId.set(target.id, 'superseded')
-  }
-  return { bySourceId, byContentId }
-}
-
-/** 只有 active 参与召回；缺 status 的旧记录按兼容策略保留。 */
-function isRecallable(status) {
-  if (status === null || status === undefined) return true
-  return status === 'active'
-}
-
 function cacheKey(cfg) {
   const files = [
     cfg.dialogueFile,

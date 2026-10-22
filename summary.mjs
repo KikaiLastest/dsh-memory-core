@@ -18,6 +18,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { readCaptureStore } from './autocapture.mjs'
 import { sanitize } from './sanitize.mjs'
+import { loadStatusMap, isRecallable } from './status.mjs'
 
 const MAX_MD_BYTES = 512 * 1024
 const MAX_SEEN = 5000
@@ -311,6 +312,7 @@ function navKey(mdFiles, cfg, maxChars, redact) {
   const files = [...mdFiles]
   if (cfg.dialogueFile) files.push(cfg.dialogueFile)
   if (cfg.autocaptureStore) files.push(cfg.autocaptureStore)
+  if (cfg.structuredFile) files.push(cfg.structuredFile) // 状态变了导航要重算
   const signature = files
     .map((file) => {
       const st = statOf(file)
@@ -339,7 +341,13 @@ export function buildNav(cfg = {}, options = {}) {
   const key = navKey(mdFiles, cfg, maxChars, redact)
   if (navCache.key === key && typeof navCache.text === 'string') return navCache.text
 
-  const entries = collectEntries(cfg, mdFiles)
+  // 导航和召回共用同一套状态判定：已经不参与召回的小节，也不该出现在常驻导航里。
+  // 否则一条被淘汰的旧决策会从「召回」这个口子消失，又从「导航」那个口子回去。
+  const { bySourceId } = loadStatusMap(cfg)
+  const entries = collectEntries(cfg, mdFiles).filter((entry) => {
+    if (entry.source !== 'dialogue') return true // 日记/捕获没有结构化状态，保持原样
+    return isRecallable(bySourceId.get('dialogue:' + entry.line))
+  })
   if (entries.length === 0) {
     navCache.key = key
     navCache.text = ''
