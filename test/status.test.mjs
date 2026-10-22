@@ -2,9 +2,17 @@ import assert from 'node:assert'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { recall } from '../index.js'
-import { consolidate } from '../consolidate.mjs'
-import { loadStatusMap, isRecallable } from '../status.mjs'
+import { recall, invalidateMemoryCache } from '../index.js'
+import { buildNav, clearSummaryCache } from '../summary.mjs'
+import { consolidate, sections } from '../consolidate.mjs'
+import {
+  idOf,
+  loadStatusMap,
+  isRecallable,
+  resolveEntryStatus,
+  filterRecallableEntries,
+  LEGACY_UNVERIFIED,
+} from '../status.mjs'
 
 // 打真实 recall 与真实 consolidate，不复制任何实现。
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'status-'))
@@ -396,6 +404,378 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
     false,
     '显式废弃的记录，任何降级策略下都不该放行',
   )
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// 生命周期故障注入（身份漂移 / 降级 / 状态表破损）
+// 每条都断言「最终状态 + 副作用」，不是只断言「没抛异常」。
+// ══════════════════════════════════════════════════════════════════════
+
+// ── 20. 真实身份漂移：只挪行号、不重新固化，内容签名必须接管 ────────────
+// 既有的 status.test 第 8 步漂移后马上又跑了一次 consolidate，
+// 而 consolidate 只在 append 时写新行、不会改写已有记录的 source_id，
+// 所以那条路径其实更接近「重新对齐」而不是「漂移」。这里只挪文件、不重跑固化。
+{
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'status-drift-'))
+  const mem = path.join(d, 'memory')
+  const sdir = path.join(mem, '记忆')
+  fs.mkdirSync(sdir, { recursive: true })
+  const dlg = path.join(d, '对话记录.md')
+  const sfile = path.join(sdir, 'structured.jsonl')
+  const wfile = path.join(sdir, '.watermark.json')
+  const body = [
+    '## 2026-10-20',
+    '',
+    '### 数据库选型',
+    '',
+    '数据库统一使用 PostgreSQL 15 作为主库，连接串走环境变量注入，不写死在代码里，迁移脚本放 migrations 目录。',
+    '',
+    '### 部署位置',
+    '',
+    '服务部署在测试机 10.0.0.5 上，先跑一周看看稳定性，没有问题再切到正式环境去，配置一起迁。',
+    '',
+  ].join('\n')
+  fs.writeFileSync(dlg, body, 'utf8')
+  consolidate({ dialogueFile: dlg, outputFile: sfile, watermarkFile: wfile })
+
+  const dcfg = {
+    memoryRoot: mem,
+    dialogueFile: dlg,
+    structuredFile: sfile,
+    topK: 5,
+    minCoverage: 0.1,
+    minMatched: 1,
+    minRatio: 0.1,
+    halfLifeDays: 30,
+  }
+  const readD = () =>
+    fs.readFileSync(sfile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const writeD = (rs) => fs.writeFileSync(sfile, rs.map((x) => JSON.stringify(x)).join('\n') + '\n', 'utf8')
+
+  let drs = readD()
+  const oldSection = sections(fs.readFileSync(dlg, 'utf8')).find((s) => s.text.includes('PostgreSQL 15'))
+  assert.ok(oldSection, '对话小节可切分')
+  const oldRecord = drs.find((r) => r.quote.includes('PostgreSQL 15'))
+  assert.equal(oldRecord.source_id, 'dialogue:' + oldSection.line, '固化时的坐标与物理行号一致')
+  drs.find((r) => r.id === oldRecord.id).status = 'superseded'
+  writeD(drs)
+
+  // 在文件最前面插一节，把后面所有小节的行号整体往后推；故意不重新固化
+  const prefix =
+    '## 2026-10-19\n\n### 补写的一节\n\n这是后来补写在最前面的一段内容，用来把后面所有小节的行号整体往后推，内容和别的节完全不同。\n\n'
+  fs.writeFileSync(dlg, prefix + body, 'utf8')
+  const drifted = sections(fs.readFileSync(dlg, 'utf8')).find((s) => s.text.includes('PostgreSQL 15'))
+  assert.ok(drifted.line > oldSection.line, '物理行号确实漂了')
+
+  const driftMap = loadStatusMap({ structuredFile: sfile })
+  assert.equal(driftMap.degraded, false, '纯漂移不是状态表损坏')
+  assert.equal(driftMap.bySourceId.has('dialogue:' + drifted.line), false, '状态表里没有漂移后的新坐标')
+  assert.equal(
+    resolveEntryStatus({ text: drifted.text, sourceId: 'dialogue:' + drifted.line }, driftMap),
+    'superseded',
+    '完整内容哈希接管：行号漂了仍然判定已取代',
+  )
+  assert.equal(
+    resolveEntryStatus({ text: drifted.text + '新增的一句', sourceId: 'dialogue:' + drifted.line }, driftMap),
+    null,
+    '正文改了就是另一条记忆，状态不跟着走（已知限制，锁死行为）',
+  )
+
+  invalidateMemoryCache()
+  const driftText = recall(dcfg, '数据库选型 PostgreSQL 15', Date.now() + 5000)
+    .map((h) => h.entry.text)
+    .join('\n')
+  assert.ok(!driftText.includes('PostgreSQL 15'), '漂移后召回端仍然不放出被取代的正文')
+  invalidateMemoryCache()
+  const deployText = recall(dcfg, '部署位置 测试机', Date.now() + 5000)
+    .map((h) => h.entry.text)
+    .join('\n')
+  assert.ok(deployText.includes('10.0.0.5'), '漂移后其他有效小节照常召回')
+
+  // 导航通道当前的输入形状：summary.mjs 的 buildNav 只传行号，不传正文。
+  // 解析器拿不到内容身份时只能回落坐标，坐标一漂就 null —— 这是「导航复活」的根因。
+  // 修在 summary.mjs（把 entry.raw 当 text 传进来）；这里把两边都锁成规格。
+  assert.equal(
+    resolveEntryStatus(
+      { contentId: undefined, text: undefined, sourceId: 'dialogue:' + drifted.line, id: 'dialogue:' + drifted.line },
+      driftMap,
+    ),
+    null,
+    '只给坐标时状态会丢（导航通道缺内容身份的根因）',
+  )
+  assert.equal(
+    resolveEntryStatus({ text: drifted.text, sourceId: 'dialogue:' + drifted.line }, driftMap),
+    'superseded',
+    '补上正文就恢复正确判定（summary.mjs 修法验证）',
+  )
+
+  fs.rmSync(d, { recursive: true, force: true })
+}
+
+// ── 21. 降级：缺 status 的 legacy 记录不能冒充显式 active ────────────────
+{
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'status-degrade-'))
+  const mem = path.join(d, 'memory')
+  const sdir = path.join(mem, '记忆')
+  fs.mkdirSync(sdir, { recursive: true })
+  const dlg = path.join(d, '对话记录.md')
+  const sfile = path.join(sdir, 'structured.jsonl')
+  const wfile = path.join(sdir, '.watermark.json')
+  const legacyTitle = '旧的迁移方案'
+  const activeTitle = '现在的部署流程'
+  const legacyBody = '旧的迁移方案是先手工导出再导入，中间还要停一次服务，流程很长而且容易出错，现在已经不用了。'
+  const activeBody = '现在的部署流程是推镜像之后滚动更新，全程不停服务，回滚只需要把镜像标签切成上一个版本就行。'
+  const body = [
+    '## 2026-10-21',
+    '',
+    '### ' + legacyTitle,
+    '',
+    legacyBody,
+    '',
+    '### ' + activeTitle,
+    '',
+    activeBody,
+    '',
+  ].join('\n')
+  fs.writeFileSync(dlg, body, 'utf8')
+  consolidate({ dialogueFile: dlg, outputFile: sfile, watermarkFile: wfile })
+
+  const readD = () =>
+    fs.readFileSync(sfile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const writeD = (rs) => fs.writeFileSync(sfile, rs.map((x) => JSON.stringify(x)).join('\n') + '\n', 'utf8')
+  const dcfg = {
+    memoryRoot: mem,
+    dialogueFile: dlg,
+    structuredFile: sfile,
+    topK: 5,
+    minCoverage: 0.1,
+    minMatched: 1,
+    minRatio: 0.1,
+    halfLifeDays: 30,
+    enableMemoryNav: true,
+    enableSanitize: true,
+  }
+
+  let drs = readD()
+  const legacyRec = drs.find((r) => r.quote.includes('手工导出'))
+  assert.ok(legacyRec, '旧迁移方案已固化')
+  delete drs.find((r) => r.id === legacyRec.id).status // 退化成没有 status 的旧记录
+  writeD(drs)
+  const legacyText = sections(fs.readFileSync(dlg, 'utf8')).find((s) => s.text.includes('手工导出')).text
+  const activeText = sections(fs.readFileSync(dlg, 'utf8')).find((s) => s.text.includes('滚动更新')).text
+
+  // 健康状态表：legacy 照常放行（契约要求的向后兼容）
+  const healthyMap = loadStatusMap({ structuredFile: sfile })
+  assert.equal(healthyMap.degraded, false)
+  assert.equal(resolveEntryStatus({ text: legacyText }, healthyMap), 'active', '健康表里 legacy 仍是可召回的 active')
+  assert.equal(healthyMap.legacyContentIds.has(legacyRec.id), true, '表里能认出这条是 legacy')
+  invalidateMemoryCache()
+  assert.ok(
+    recall(dcfg, '手工导出 迁移 停服务', Date.now() + 5000).some((h) => h.entry.text.includes('手工导出')),
+    '健康状态下 legacy 记录照常召回',
+  )
+
+  // 注入一条截断行让状态表降级
+  fs.appendFileSync(sfile, '{"id":"mem-truncated","source_id":"dialogue:9","status":"active"', 'utf8')
+  const degradedMap = loadStatusMap({ structuredFile: sfile })
+  assert.equal(degradedMap.degraded, true, '截断行让状态表降级')
+  assert.equal(degradedMap.reason, 'partial_corrupt')
+
+  assert.equal(
+    resolveEntryStatus({ text: legacyText }, degradedMap),
+    LEGACY_UNVERIFIED,
+    '降级时 legacy 返回哨兵，不再冒充显式 active',
+  )
+  assert.equal(resolveEntryStatus({ text: activeText }, degradedMap), 'active', '显式 active 不受影响')
+  assert.equal(isRecallable(LEGACY_UNVERIFIED, { degraded: true }), false, '哨兵默认不可召回')
+  assert.equal(isRecallable(LEGACY_UNVERIFIED, { degraded: true, conservative: false }), true, '显式关掉保守才放行')
+
+  const filtered = filterRecallableEntries(
+    [{ text: legacyText }, { text: activeText }],
+    degradedMap,
+    { conservative: true },
+  )
+  assert.deepEqual(
+    filtered.recallable.map((e) => e.text),
+    [activeText],
+    '降级过滤后只剩显式 active 的那条',
+  )
+  assert.equal(filtered.legacySuppressed, 1, '准确记账被压掉的 legacy 条数')
+  assert.equal(filtered.unverified, 1)
+
+  // 召回端：legacy 消失、显式 active 仍在
+  invalidateMemoryCache()
+  const degradedHits = recall(dcfg, '手工导出 导入 容易出错', Date.now() + 5000)
+  assert.equal(degradedHits.length, 0, '降级时 legacy 记录不召回')
+  invalidateMemoryCache()
+  assert.ok(
+    recall(dcfg, '滚动更新 镜像标签', Date.now() + 5000).some((h) => h.entry.text.includes('滚动更新')),
+    '降级时显式 active 记录照常召回',
+  )
+
+  // 导航端必须和召回给同一个答案（否则旧决策会从导航漏回来）
+  clearSummaryCache()
+  const navDegraded = buildNav(dcfg)
+  assert.ok(!navDegraded.includes(legacyTitle), '降级时 legacy 小节不进导航')
+  assert.ok(navDegraded.includes(activeTitle), '降级时有效小节仍在导航里')
+
+  // 修好状态表之后 legacy 立刻恢复，说明降级只是临时闸门，不是永久删除
+  writeD(
+    fs
+      .readFileSync(sfile, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l)
+        } catch {
+          return null // 故意注入的截断行，修表时丢掉
+        }
+      })
+      .filter(Boolean),
+  )
+  invalidateMemoryCache()
+  assert.ok(
+    recall(dcfg, '手工导出 迁移 停服务', Date.now() + 5000).some((h) => h.entry.text.includes('手工导出')),
+    '状态表修复后 legacy 记录恢复召回',
+  )
+
+  fs.rmSync(d, { recursive: true, force: true })
+}
+
+// ── 22. contentId 与正文哈希矛盾：取更严的一侧，不许靠 content_id 洗白 ──
+{
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'status-conflict-'))
+  const cfile = path.join(d, 'conflict.jsonl')
+  const textX = '### 仍在使用的现行方案\n\n现行方案是这一套，所有环境都按它来配置和部署，文档也已经同步。'
+  const textY = '### 已被淘汰的历史方案\n\n历史方案是另外一套，维护成本太高，已经整体替换掉了，不再使用。'
+  const X = { id: idOf(textX), source_id: 'dialogue:1', status: 'active' }
+  const Y = { id: idOf(textY), source_id: 'dialogue:2', status: 'superseded' }
+  fs.writeFileSync(cfile, [X, Y].map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+  const cmap = loadStatusMap({ structuredFile: cfile })
+  assert.equal(cmap.degraded, false)
+
+  assert.equal(
+    resolveEntryStatus({ contentId: X.id, text: textY }, cmap),
+    'superseded',
+    'content_id 指向有效记录、正文却是已淘汰内容：按更严的一侧判定',
+  )
+  assert.equal(
+    resolveEntryStatus({ contentId: Y.id, text: textX }, cmap),
+    'superseded',
+    'content_id 指向已淘汰记录、正文有效：同样按更严的一侧判定',
+  )
+  assert.equal(resolveEntryStatus({ contentId: X.id, text: textX }, cmap), 'active', '两边一致时正常放行')
+  assert.equal(
+    resolveEntryStatus({ contentId: X.id, text: '一段和状态表毫无关系的正文，内容哈希根本对不上。' }, cmap),
+    'active',
+    '正文对不上任何记录时不该误伤 content_id 的有效身份',
+  )
+  assert.equal(
+    resolveEntryStatus({ contentId: 'mem-not-in-table', text: textY }, cmap),
+    'superseded',
+    '未知 content_id 不能绕过正文哈希',
+  )
+  fs.rmSync(d, { recursive: true, force: true })
+}
+
+// ── 23. 截断 / 非法 status 的最终状态与副作用 ──────────────────────────
+{
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'status-broken-'))
+  const bfile = path.join(d, 'broken.jsonl')
+  const tActive = '### 有效记录一\n\n这条记录状态完整，应该一直被当作有效记忆来用，不受同文件坏行影响。'
+  const tBadEnum = '### 状态字段坏掉的记录\n\n这条记录写了非法状态枚举，整条必须被丢弃，不能悄悄改成 active 放行。'
+  const tActive2 = '### 有效记录二\n\n另一条状态完整的记录，同样应该在破损状态表里继续维持显式 active 身份。'
+  const tCut = '### 被截断的半条记录\n\n这条记录只写了一半就被截断了，绝不能当成有效 active 记录被收进状态表。'
+  const lines = [
+    JSON.stringify({ id: idOf(tActive), source_id: 'dialogue:1', status: 'active' }),
+    JSON.stringify({ id: idOf(tBadEnum), source_id: 'dialogue:2', status: 'deleted' }),
+    JSON.stringify({ id: idOf(tActive2), source_id: 'dialogue:3', status: 'active' }),
+    '{"id":"' + idOf(tCut) + '","source_id":"dialogue:4","status":"active"',
+  ]
+  fs.writeFileSync(bfile, lines.join('\n'), 'utf8')
+  const bmap = loadStatusMap({ structuredFile: bfile })
+
+  assert.equal(bmap.degraded, true, '坏行与非法枚举都必须触发降级')
+  assert.equal(bmap.reason, 'partial_corrupt')
+  assert.equal(bmap.syntaxErrors, 1, '准确统计 1 行截断')
+  assert.equal(bmap.schemaErrors, 1, '准确统计 1 行非法 status')
+  assert.equal(bmap.validRecords, 2, '2 条记录有效')
+  assert.equal(bmap.totalRecords, 4, '解析尝试 4 行')
+  assert.equal(bmap.brokenLines, 2)
+  assert.equal(bmap.byContentId.has(idOf(tCut)), false, '被截断的记录没有被当成 active 收进状态表')
+  assert.equal(bmap.byContentId.has(idOf(tBadEnum)), false, '非法 status 的整条记录被丢弃，不是改成 active')
+
+  assert.equal(resolveEntryStatus({ text: tCut }, bmap), null, '截断记录没有状态，按未受管理处理')
+  assert.equal(isRecallable(null, { degraded: true }), false, '降级时未受管理的记录不可召回')
+  assert.equal(resolveEntryStatus({ text: tActive }, bmap), 'active')
+  assert.equal(isRecallable('active', { degraded: true }), true, '显式 active 在降级时仍然可用')
+
+  const bfilter = filterRecallableEntries([{ text: tCut }, { text: tBadEnum }, { text: tActive }], bmap, {
+    conservative: true,
+  })
+  assert.deepEqual(bfilter.recallable.map((e) => e.text), [tActive], '降级过滤后只剩显式 active')
+  assert.equal(bfilter.unverified, 2, '截断与非法枚举两条都记作 unverified')
+  fs.rmSync(d, { recursive: true, force: true })
+}
+
+// ── 24. 悬空 supersedes 的副作用：不污染自己，也不凭空造出目标 ──────────
+{
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'status-dangling-'))
+  const file = path.join(d, 'dangling.jsonl')
+  const t1 = '### 现行部署目标\n\n现在部署到生产机 10.0.0.9，旧的测试机已经停用，配置文件也一起迁过去了。'
+  const t2 = '### 另外一个主题\n\n这一节和部署无关，写的是日志收集和轮转策略，按天切割保留七天。'
+  const t3 = '### 没有状态标记的历史条目\n\n这条记录没有 status 字段，属于旧版本固化产物，在健康表里应该照常可召回。'
+  const r1 = { id: idOf(t1), source_id: 'dialogue:1', status: 'active', supersedes: 'mem-ghost' }
+  const r2 = { id: idOf(t2), source_id: 'dialogue:2', status: 'active' }
+  const r3 = { id: idOf(t3), source_id: 'dialogue:3' }
+  fs.writeFileSync(file, [r1, r2, r3].map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+  const dmap = loadStatusMap({ structuredFile: file })
+
+  assert.equal(dmap.degraded, true, '悬空引用触发降级')
+  assert.equal(dmap.reason, 'dangling_reference')
+  assert.equal(dmap.danglingRefs, 1)
+  assert.equal(dmap.byContentId.get(r1.id), 'active', '指向不存在目标的记录自己仍然是 active')
+  assert.equal(dmap.byContentId.has('mem-ghost'), false, '不存在的目标不会被凭空写进内容表')
+  assert.equal(
+    [...dmap.bySourceId.values()].includes('superseded'),
+    false,
+    '悬空引用不会把某个坐标伪造成 superseded',
+  )
+  assert.equal(resolveEntryStatus({ text: t1 }, dmap), 'active')
+  assert.equal(resolveEntryStatus({ text: t3 }, dmap), LEGACY_UNVERIFIED, '降级时 legacy 记录被压掉')
+
+  const dfilter = filterRecallableEntries([{ text: t1 }, { text: t2 }, { text: t3 }], dmap, {
+    conservative: true,
+  })
+  assert.equal(dfilter.recallable.length, 2, '两条显式 active 保留')
+  assert.equal(dfilter.legacySuppressed, 1, '一条 legacy 被压掉')
+  fs.rmSync(d, { recursive: true, force: true })
+}
+
+// ── 25. 坐标冲突是非致命诊断：内容哈希优先，纯坐标保守压掉 ──────────────
+{
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'status-coord-'))
+  const file = path.join(d, 'coord.jsonl')
+  const tNew = '### 同一个物理行上的新内容\n\n改过正文之后重新固化，落在了同一个物理行坐标上，这是正常生命周期。'
+  const tOld = '### 同一个物理行上的旧内容\n\n旧正文已经被改写掉了，但旧记录还留在状态表里等着被追溯，不该再被召回。'
+  const rNew = { id: idOf(tNew), source_id: 'dialogue:7', status: 'active' }
+  const rOld = { id: idOf(tOld), source_id: 'dialogue:7', status: 'superseded' }
+  fs.writeFileSync(file, [rNew, rOld].map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+  const cmap = loadStatusMap({ structuredFile: file })
+
+  assert.equal(cmap.degraded, false, '坐标冲突不按损坏处理，不然改一次正文就全表停用')
+  assert.equal(cmap.reason, 'ok')
+  assert.equal(cmap.coordinateConflicts, 1, '坐标冲突要记账')
+  assert.equal(cmap.bySourceId.get('dialogue:7'), 'superseded', '冲突坐标保守归约为 superseded')
+  assert.equal(resolveEntryStatus({ text: tNew }, cmap), 'active', '新内容靠内容哈希照样可用')
+  assert.equal(
+    resolveEntryStatus({ sourceId: 'dialogue:7' }, cmap),
+    'superseded',
+    '只按坐标查（导航形状）时保守压掉，宁可不显示也不放旧决策',
+  )
+  fs.rmSync(d, { recursive: true, force: true })
 }
 
 fs.rmSync(dir, { recursive: true, force: true })
