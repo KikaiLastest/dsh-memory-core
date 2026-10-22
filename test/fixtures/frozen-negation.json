@@ -1,0 +1,81 @@
+[
+  {
+    "q": "还能用 Moment 吗",
+    "expect": "不要再用 Moment.js",
+    "forbid": []
+  },
+  {
+    "q": "jQuery 能引入吗",
+    "expect": "不要引入 jQuery",
+    "forbid": []
+  },
+  {
+    "q": "花生能吃吗",
+    "expect": "严重过敏",
+    "forbid": []
+  },
+  {
+    "q": "香菜吃不吃",
+    "expect": "不吃香菜",
+    "forbid": []
+  },
+  {
+    "q": "能吃多辣",
+    "expect": "微辣",
+    "forbid": []
+  },
+  {
+    "q": "下午喝咖啡行吗",
+    "expect": "三点以后不喝",
+    "forbid": []
+  },
+  {
+    "q": "数据库现在还是 PostgreSQL 吗",
+    "expect": "换成 MySQL 8",
+    "forbid": [
+      "PostgreSQL 15"
+    ]
+  },
+  {
+    "q": "测试机还在用吗",
+    "expect": "已停用",
+    "forbid": []
+  },
+  {
+    "q": "Vim 还在用吗",
+    "expect": "换成了 VS Code",
+    "forbid": []
+  },
+  {
+    "q": "仍然用两个空格缩进吗",
+    "expect": "四个空格",
+    "forbid": [
+      "两个空格"
+    ]
+  },
+  {
+    "q": "花生油可以碰吗",
+    "expect": "包括花生油",
+    "forbid": []
+  },
+  {
+    "q": "周末几点起",
+    "expect": "多睡一个小时",
+    "forbid": []
+  },
+  {
+    "q": "下雨天怎么上班",
+    "expect": "改坐公交",
+    "forbid": []
+  },
+  {
+    "q": "视频缓存留几集",
+    "expect": "只缓存当前正在看的这一集",
+    "forbid": []
+  },
+  {
+    "q": "音乐缓存淘汰规则",
+    "expect": "最久没有播放",
+    "forbid": []
+  }
+]

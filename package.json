@@ -73,6 +73,7 @@
     "quality": "node scripts/quality-eval.mjs",
     "quality:gate": "node scripts/quality-eval.mjs --strict",
     "eval": "node test/eval.mjs --strict",
-    "consolidate": "node consolidate.mjs"
+    "consolidate": "node consolidate.mjs",
+    "quality:frozen": "node scripts/quality-frozen.mjs"
   }
 }

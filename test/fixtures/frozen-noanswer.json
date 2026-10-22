@@ -1,0 +1,81 @@
+[
+  {
+    "q": "量子计算机现在什么水平",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "怎么申请房贷",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "推荐一本讲春秋历史的书",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "明天天气怎么样",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "股票今天涨了吗",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "Python 的 GIL 怎么绕过",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "怎么给猫剪指甲",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "柯基掉毛严重吗",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "日本签证要准备什么",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "怎么练引体向上",
+    "expect": null,
+    "forbid": []
+  },
+  {
+    "q": "缓存目录在哪",
+    "expect": "可写数据目录",
+    "forbid": []
+  },
+  {
+    "q": "视频播放器缓存多少",
+    "expect": "只缓存当前正在看的这一集",
+    "forbid": [
+      "两百首"
+    ]
+  },
+  {
+    "q": "音乐播放器缓存多少",
+    "expect": "两百首",
+    "forbid": [
+      "当前正在看的这一集"
+    ]
+  },
+  {
+    "q": "MySQL 版本",
+    "expect": "MySQL 8",
+    "forbid": []
+  },
+  {
+    "q": "记账用的什么工具",
+    "expect": "本地表格",
+    "forbid": []
+  }
+]
