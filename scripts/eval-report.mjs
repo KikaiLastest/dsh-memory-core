@@ -448,9 +448,17 @@ export function parseJsonTarget(argv, toolName) {
   const wanted = flag ? inline || explicit || null : envPath || null
   if (wanted === '-') return { mode: 'stdout', path: null }
   if (wanted) return { mode: 'file', path: path.resolve(wanted) }
+  // TEMP 缺失时 os.tmpdir() 会返回 "undefined\temp" 这种字符串，别把报告写进怪路径。
+  const base = (() => {
+    const t = os.tmpdir()
+    try {
+      if (t && fs.existsSync(t)) return t
+    } catch {}
+    return process.cwd()
+  })()
   return {
     mode: 'file',
-    path: path.join(os.tmpdir(), 'dsh-memory-quality', path.basename(toolName).replace(/\.mjs$/, '') + '.json'),
+    path: path.join(base, 'dsh-memory-quality', path.basename(toolName).replace(/\.mjs$/, '') + '.json'),
   }
 }
 
