@@ -248,6 +248,11 @@ let cache = { key: '', entries: [], idf: null }
 // 状态表降级只警告一次，不跟着每一轮召回刷屏
 let warnedDegraded = false
 
+/** 测试与基准测量用：显式使全局单例缓存失效，确保下一次调用必定走完整的冷启动全链路。 */
+export function invalidateMemoryCache() {
+  cache = { key: '', entries: [], idf: null }
+}
+
 /**
  * 读固化产物的状态表：source_id -> status。
  *

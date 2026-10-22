@@ -203,23 +203,30 @@ export function loadStatusMap(cfg = {}) {
 
   const byMemId = new Map()
   const records = []
-  let brokenLines = 0
+  let syntaxErrors = 0
+  let schemaErrors = 0
+  let totalLines = 0
 
   for (const line of text.split('\n')) {
     if (!line.trim()) continue
+    totalLines += 1
     let rec
     try {
       rec = JSON.parse(line)
     } catch {
-      brokenLines += 1
+      syntaxErrors += 1
       continue
     }
-    if (!rec || !rec.source_id) continue
+    // 严格契约校验：缺少 id 或 source_id 的记录属于结构性坏数据，不能静默放过
+    if (!rec || typeof rec !== 'object' || !rec.id || !rec.source_id) {
+      schemaErrors += 1
+      continue
+    }
     const status = typeof rec.status === 'string' ? rec.status : null
     records.push({ rec, status })
     byMemId.set(rec.id, rec)
     bySourceId.set(rec.source_id, status)
-    if (rec.id) byContentId.set(rec.id, status)
+    byContentId.set(rec.id, status)
   }
 
   // 关系链覆盖：无论记录本身标什么，只要被任何记录 supersedes 指向，强制置为 superseded
@@ -231,13 +238,22 @@ export function loadStatusMap(cfg = {}) {
     if (target.id) byContentId.set(target.id, 'superseded')
   }
 
-  const degraded = records.length === 0 && brokenLines > 0
+  const badLines = syntaxErrors + schemaErrors
+  const isCorrupt = records.length === 0 && badLines > 0
+  const isPartialCorrupt = records.length > 0 && badLines > 0
+  const degraded = isCorrupt || isPartialCorrupt
+  const reason = isCorrupt ? 'corrupt' : (isPartialCorrupt ? 'partial_corrupt' : 'ok')
+
   return {
     bySourceId,
     byContentId,
     degraded,
-    reason: degraded ? 'corrupt' : 'ok',
+    reason,
     totalRecords: records.length,
-    brokenLines,
+    validRecords: records.length,
+    totalLines,
+    syntaxErrors,
+    schemaErrors,
+    brokenLines: badLines,
   }
 }

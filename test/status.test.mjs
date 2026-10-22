@@ -220,6 +220,28 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
   assert.equal(healthy.degraded, false, '正常状态表不该被判成降级')
   assert.equal(healthy.reason, 'ok')
   assert.ok(healthy.byContentId.size > 0)
+
+  // ── 11. 部分损坏：有效记录中夹杂坏行或残缺 schema ────────────────
+  // 审查阻塞点 P0：不能因为有有效记录就把整张表假装成完全健康！
+  const partialCorruptFile = path.join(dir, 'partial-corrupt.jsonl')
+  fs.writeFileSync(
+    partialCorruptFile,
+    [
+      JSON.stringify({ id: 'mem-1', source_id: 'dialogue:1', status: 'active' }),
+      '{坏掉的截断行，json 解析必定抛错',
+      JSON.stringify({ id: 'mem-2', status: 'active' }), // 缺少关键契约 source_id
+      JSON.stringify({ id: 'mem-3', source_id: 'dialogue:3', status: 'superseded' }),
+    ].join('\n') + '\n',
+    'utf8',
+  )
+  const partial = loadStatusMap({ structuredFile: partialCorruptFile })
+  assert.equal(partial.degraded, true, '部分损坏的文件必须被标记为降级状态')
+  assert.equal(partial.reason, 'partial_corrupt')
+  assert.equal(partial.validRecords, 2, '2 条有效合法记录应被成功解析')
+  assert.equal(partial.syntaxErrors, 1, '准确统计 1 行 JSON 语法损坏')
+  assert.equal(partial.schemaErrors, 1, '准确统计 1 行缺少 source_id 的 schema 损坏')
+  assert.equal(partial.brokenLines, 2, '总坏行数必须准确等于 2')
+  assert.equal(partial.byContentId.get('mem-3'), 'superseded', '已解析出的淘汰关系仍然可用')
 }
 
 fs.rmSync(dir, { recursive: true, force: true })
