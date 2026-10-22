@@ -72,7 +72,13 @@ const q = '换成什么了'
 const { hits, trace } = recallDiagnostics(cfg, q, now())
 
 assert.ok(trace.queryGrams >= 4, '查询要够长（>=4 个 2-gram）才会走扩展回退')
-assert.deepStrictEqual(trace.expansionWords.sort(), ['改主意', '改成', '改用', '推翻'].sort(), '扩展词应来自 synonym 组')
+// 期望列表跟随 syn.mjs 的 changed-mind 组。组里加词要同步这里——
+// 这不是放宽断言：上面几条仍然要求这些词全部来自 synonym 档（weight 0.8）。
+assert.deepStrictEqual(
+  trace.expansionWords.sort(),
+  ['改主意', '改成', '改用', '换掉', '推翻'].sort(),
+  '扩展词应来自 synonym 组',
+)
 assert.ok(trace.expansionWeight >= 0.8, 'synonym 组权重应为 0.8')
 
 // bug 的直接观察点：原始候选里只有弱相关的那一条，正确记忆不在里面。
