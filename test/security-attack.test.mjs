@@ -49,7 +49,8 @@ const TOKENS = [
   'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz012345', // fine-grained
   'AKIAIOSFODNN7EXAMPLE', // AWS 长期凭证
   'ASIAIOSFODNN7EXAMPLE', // AWS 临时凭证（STS）—— 原先漏
-  'xoxb-' + '123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx', // Slack
+  // Slack：前缀与主体分开拼，避免仓库扫描把测试夹具当成真实密钥拦下推送
+  'xoxb-' + '123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx',
   'sk_live_51H8xYzabcdefghijklmnop', // Stripe
   'AIzaSyD-1234567890abcdefghijklmnopqrs', // Google API
   'npm_abcdefghijklmnopqrstuvwxyz0123456789', // npm
