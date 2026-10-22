@@ -33,6 +33,15 @@ export function titleFingerprint(text) {
 }
 
 /**
+ * 降级保护下的 legacy 哨兵。
+ *
+ * 只有当状态表 `degraded` 且命中的记录确实没有 status 字段时才返回：
+ * 那种记录无法证明自己没被淘汰，按契约「宁可少召回」处理。
+ * 它不会出现在 structured.jsonl 里；召回与导航共用 isRecallable，答案因此一致。
+ */
+export const LEGACY_UNVERIFIED = 'legacy-unverified'
+
+/**
  * 解析任意记忆条目（原文小节、摘要或捕获项）在当前状态表中的权威状态。
  *
  * 优先级顺序严格固定：
@@ -40,31 +49,61 @@ export function titleFingerprint(text) {
  * 2. 文本内容哈希计算所得身份 (idOf(entry.text))
  * 3. 来源物理坐标 (entry.sourceId || entry.id)
  *
+ * 两条保守规则：
+ * - 身份冲突取更严的一侧：contentId 指向 active、正文哈希却指向 superseded 时返回 superseded。
+ *   否则一条抄着已淘汰正文的条目，只要 content_id 填了有效记录就能洗白。
+ * - 降级 + legacy：状态表损坏时，缺 status 字段的记录返回 LEGACY_UNVERIFIED，不再被当成显式 active。
+ *   旧版本固化产物（没有 status 字段）在表一坏时整体停用，这是契约里的保守方向。
+ *
  * @param {Object} entry 记忆条目
  * @param {Object} statusMap loadStatusMap 返回的状态映射
- * @returns {string|null} 'active' | 'superseded' | 'archived' | 'draft' | null(未受状态管理)
+ * @returns {string|null} 'active' | 'superseded' | 'archived' | 'draft' | 'legacy-unverified' | null(未受状态管理)
  */
 export function resolveEntryStatus(entry, statusMap) {
   if (!entry || !statusMap) return null
-  const { byContentId, bySourceId } = statusMap
+  const byContentId = statusMap.byContentId
+  const bySourceId = statusMap.bySourceId
+  const degraded = Boolean(statusMap.degraded)
+  const legacyContentIds = statusMap.legacyContentIds
+  const legacySourceIds = statusMap.legacySourceIds
+
+  let active = null
+  let legacyHit = false
+  let blocked = null
+
+  const consider = (status, isLegacy) => {
+    if (status === undefined || status === null) return
+    if (status !== 'active') {
+      // 多个身份里只要有一个说「不是 active」，就按不可召回处理
+      if (blocked === null) blocked = status
+      return
+    }
+    if (isLegacy) legacyHit = true
+    if (active === null) active = status
+  }
 
   // 1. 显式内容身份优先（例如摘要中记录的原文 content_id）
-  if (entry.contentId && byContentId.has(entry.contentId)) {
-    return byContentId.get(entry.contentId)
+  if (entry.contentId && byContentId?.has(entry.contentId)) {
+    consider(byContentId.get(entry.contentId), Boolean(legacyContentIds?.has(entry.contentId)))
   }
 
   // 2. 原文内容完整哈希（原文条目）
   if (entry.text) {
     const cid = idOf(entry.text)
-    if (byContentId.has(cid)) {
-      return byContentId.get(cid)
+    if (byContentId?.has(cid)) {
+      consider(byContentId.get(cid), Boolean(legacyContentIds?.has(cid)))
     }
   }
 
+  if (blocked !== null) return blocked
+  if (active !== null) return degraded && legacyHit ? LEGACY_UNVERIFIED : active
+
   // 3. 来源位置匹配（辅助兜底：行号命中且未被内容哈希覆盖）
   const src = entry.sourceId || entry.id
-  if (src && bySourceId.has(src)) {
-    return bySourceId.get(src)
+  if (src && bySourceId?.has(src)) {
+    consider(bySourceId.get(src), Boolean(legacySourceIds?.has(src)))
+    if (blocked !== null) return blocked
+    if (active !== null) return degraded && legacyHit ? LEGACY_UNVERIFIED : active
   }
 
   return null
@@ -84,6 +123,12 @@ export function isRecallable(status, options = {}) {
   // 反过来（默认放行）会让被 superseded 的旧决策在状态表一坏时整体复活，
   // 而模型会照着它执行——这比「记不住」危险得多。
   const { degraded = false, conservative = true } = options
+
+  // 降级下无法自证的 legacy 记录跟随同一个 conservative 开关：
+  // 默认压掉，显式 conservative=false 才放行（给整表破损时留一个逃生口）。
+  if (status === LEGACY_UNVERIFIED) {
+    return !conservative
+  }
 
   // 显式废弃/归档/草稿，任何时候坚决不可召回
   if (status && status !== 'active') {
@@ -125,17 +170,23 @@ export function filterRecallableEntries(entries, statusMap, options = {}) {
   const degraded = Boolean(statusMap && statusMap.degraded)
   // 和 isRecallable 同一个安全默认：降级时宁可少召回，不可放出过期决策
   const conservative = options.conservative === undefined ? true : Boolean(options.conservative)
+  let legacySuppressed = 0
 
   for (const entry of entries) {
     const status = resolveEntryStatus(entry, statusMap)
 
-    // 探测行号漂移：内容哈希没中，但物理行号撞上了其他记录
-    if (status === null && entry.id && statusMap.bySourceId && statusMap.bySourceId.has(entry.id)) {
+    // 探测行号漂移：内容哈希没中，但物理坐标撞上了其他记录。
+    // 用的键必须和 resolveEntryStatus 第三层一致（sourceId 优先），否则统计会永远为 0。
+    const coordinate = entry.sourceId || entry.id
+    if (status === null && coordinate && statusMap && statusMap.bySourceId && statusMap.bySourceId.has(coordinate)) {
       idDrift += 1
     }
 
     if (!isRecallable(status, { degraded, conservative })) {
-      if (status && status !== 'active') {
+      if (status === LEGACY_UNVERIFIED) {
+        unverified += 1
+        legacySuppressed += 1
+      } else if (status && status !== 'active') {
         suppressed += 1
       } else {
         unverified += 1
@@ -146,7 +197,7 @@ export function filterRecallableEntries(entries, statusMap, options = {}) {
     recallable.push(entry)
   }
 
-  return { recallable, suppressed, unverified, idDrift }
+  return { recallable, suppressed, unverified, idDrift, legacySuppressed }
 }
 
 export const VALID_STATUSES = new Set(['active', 'superseded', 'archived', 'draft'])
@@ -160,41 +211,61 @@ export const VALID_STATUSES = new Set(['active', 'superseded', 'archived', 'draf
  *   - 'empty': 文件存在但内容为零字节或纯空白（截断/损坏），强制 degraded=true 保护
  *   - 'unreadable': 文件存在但由于权限/锁读取失败，强制 degraded=true 保护
  *   - 'corrupt': 存在非空行但全部记录解析或结构损坏，强制 degraded=true 保护
+ *   - 'cycle_conflict': 替代关系形成有向环（A 取代 B、B 又取代 A），强制降级
+ *   - 'dangling_reference': supersedes 指向文件里不存在的 id，强制降级
  *   - 'partial_corrupt': 包含有效记录，但夹杂语法坏行、非法状态枚举或缺少契约，强制 degraded=true
  *   - 'ok': 状态文件完整，且全部记录通过 schema 契约校验
+ *
+ * 非致命的诊断（不影响 degraded，只是记账）：
+ *   - coordinateConflicts: 同一 source_id 上出现互相矛盾的状态。归并时保守取 'superseded'，
+ *     但这是正常生命周期（改过正文再固化会复用同一物理行），不按损坏处理。
  *
  * @param {Object} cfg 配置对象，需包含 structuredFile
  * @returns {{
  *   bySourceId: Map<string, string>,
  *   byContentId: Map<string, string>,
+ *   legacyContentIds: Set<string>,
+ *   legacySourceIds: Set<string>,
  *   degraded: boolean,
- *   reason: 'ok' | 'missing' | 'empty' | 'unreadable' | 'corrupt' | 'partial_corrupt' | 'not_configured',
+ *   reason: 'ok' | 'missing' | 'empty' | 'unreadable' | 'corrupt' | 'cycle_conflict' | 'dangling_reference' | 'partial_corrupt' | 'not_configured',
  *   totalRecords: number,
  *   validRecords: number,
  *   totalLines: number,
  *   syntaxErrors: number,
  *   schemaErrors: number,
+ *   coordinateConflicts: number,
+ *   danglingRefs: number,
+ *   cycleErrors: number,
  *   brokenLines: number
  * }}
  */
+/** 统一构造状态表返回结构：四处字面量各写一遍，少一个字段就是一次召回事故。 */
+function emptyStatusMap(overrides) {
+  return {
+    bySourceId: new Map(),
+    byContentId: new Map(),
+    legacyContentIds: new Set(),
+    legacySourceIds: new Set(),
+    degraded: false,
+    reason: 'ok',
+    totalRecords: 0,
+    validRecords: 0,
+    totalLines: 0,
+    syntaxErrors: 0,
+    schemaErrors: 0,
+    coordinateConflicts: 0,
+    danglingRefs: 0,
+    cycleErrors: 0,
+    brokenLines: 0,
+    ...overrides,
+  }
+}
+
 export function loadStatusMap(cfg = {}) {
-  const bySourceId = new Map()
-  const byContentId = new Map()
   const file = cfg.structuredFile
 
   if (!file) {
-    return {
-      bySourceId,
-      byContentId,
-      degraded: false,
-      reason: 'not_configured',
-      totalRecords: 0,
-      validRecords: 0,
-      totalLines: 0,
-      syntaxErrors: 0,
-      schemaErrors: 0,
-      brokenLines: 0,
-    }
+    return emptyStatusMap({ reason: 'not_configured' })
   }
 
   let text = ''
@@ -202,42 +273,23 @@ export function loadStatusMap(cfg = {}) {
     text = fs.readFileSync(file, 'utf8')
   } catch (err) {
     const missing = err && err.code === 'ENOENT'
-    return {
-      bySourceId,
-      byContentId,
-      degraded: !missing,
-      reason: missing ? 'missing' : 'unreadable',
-      totalRecords: 0,
-      validRecords: 0,
-      totalLines: 0,
-      syntaxErrors: 0,
-      schemaErrors: 0,
-      brokenLines: 0,
-    }
+    return emptyStatusMap({ degraded: !missing, reason: missing ? 'missing' : 'unreadable' })
   }
 
   // 区分「文件不存在」与「文件存在但被截断为空」：
   // 文件存在却为空说明经历了异常清空或截断，不能按首次运行的兼容策略放行
   if (!text.trim()) {
-    return {
-      bySourceId,
-      byContentId,
-      degraded: true,
-      reason: 'empty',
-      totalRecords: 0,
-      validRecords: 0,
-      totalLines: 0,
-      syntaxErrors: 0,
-      schemaErrors: 0,
-      brokenLines: 0,
-    }
+    return emptyStatusMap({ degraded: true, reason: 'empty' })
   }
 
+  const bySourceId = new Map()
+  const byContentId = new Map()
+  // 没写 status 字段的记录：正常时按 legacy 放行，降级时不能再冒充显式 active
+  const legacyIds = new Set()
   const byMemId = new Map()
   const records = []
   let syntaxErrors = 0
   let schemaErrors = 0
-  let conflictErrors = 0
   let totalLines = 0
   let danglingRefs = 0
 
@@ -267,9 +319,11 @@ export function loadStatusMap(cfg = {}) {
     }
 
     let status = 'active'
+    let statusExplicit = false
     if (rec.status !== undefined && rec.status !== null) {
       if (typeof rec.status === 'string' && VALID_STATUSES.has(rec.status)) {
         status = rec.status
+        statusExplicit = true
       } else {
         // 非法枚举或非法类型（数字、数组等）
         schemaErrors += 1
@@ -299,28 +353,37 @@ export function loadStatusMap(cfg = {}) {
     records.push({ rec, status })
     byMemId.set(rec.id, rec)
     byContentId.set(rec.id, status)
+    if (!statusExplicit) legacyIds.add(rec.id)
   }
 
   // ── 来源坐标 source_id 一对多顺序无关确定性归并 ──────────────────────
   // 物理行号会随文件编辑插入而自然漂移。同一 source_id 在不同历史小节中出现时：
   // 采用状态集合归并，彻底消除 Map.set() 依赖文件行遍历顺序的不确定性。
   const sourceStatuses = new Map()
+  const sourceAllLegacy = new Map() // 该坐标上的记录是否全部没有 status 字段
   for (const { rec, status } of records) {
     let set = sourceStatuses.get(rec.source_id)
     if (!set) {
       set = new Set()
       sourceStatuses.set(rec.source_id, set)
+      sourceAllLegacy.set(rec.source_id, true)
     }
     set.add(status)
+    if (!legacyIds.has(rec.id)) sourceAllLegacy.set(rec.source_id, false)
   }
+  let coordinateConflicts = 0
+  const legacySourceIds = new Set()
   for (const [srcId, set] of sourceStatuses) {
     if (set.size === 1) {
       bySourceId.set(srcId, set.values().next().value)
     } else {
       // 出现状态歧义（同一坐标既有 active 又有 superseded），保守归约为 'superseded'
-      // 避免行顺序随机决定状态，强制依赖内容哈希作为权威身份
+      // 避免行顺序随机决定状态，强制依赖内容哈希作为权威身份。
+      // 不算成致命损坏：改过正文再固化，同一条物理行自然会出现新旧两条记录，这是正常生命周期。
+      coordinateConflicts += 1
       bySourceId.set(srcId, 'superseded')
     }
+    if (sourceAllLegacy.get(srcId)) legacySourceIds.add(srcId)
   }
 
   // ── 有向图引用完整性、覆盖传递与迭代式环路检测（Stack-Safe Cycle Detection）──
@@ -367,7 +430,7 @@ export function loadStatusMap(cfg = {}) {
     }
   }
 
-  const badLines = syntaxErrors + schemaErrors + conflictErrors + danglingRefs + cycleErrors
+  const badLines = syntaxErrors + schemaErrors + danglingRefs + cycleErrors
   const isCorrupt = records.length === 0 && badLines > 0
   const isPartialCorrupt = records.length > 0 && badLines > 0
   const degraded = isCorrupt || isPartialCorrupt
@@ -379,8 +442,6 @@ export function loadStatusMap(cfg = {}) {
     reason = 'cycle_conflict'
   } else if (danglingRefs > 0) {
     reason = 'dangling_reference'
-  } else if (conflictErrors > 0) {
-    reason = 'source_conflict'
   } else if (isPartialCorrupt) {
     reason = 'partial_corrupt'
   }
@@ -388,14 +449,18 @@ export function loadStatusMap(cfg = {}) {
   return {
     bySourceId,
     byContentId,
+    legacyContentIds: legacyIds,
+    legacySourceIds,
     degraded,
     reason,
-    totalRecords: records.length,
+    // totalRecords 是「解析尝试过的非空行数」，和 validRecords 不是一回事：
+    // 两者相等时说明一行都没坏，差多少就是坏了多少。
+    totalRecords: totalLines,
     validRecords: records.length,
     totalLines,
     syntaxErrors,
     schemaErrors,
-    conflictErrors,
+    coordinateConflicts,
     danglingRefs,
     cycleErrors,
     brokenLines: badLines,
