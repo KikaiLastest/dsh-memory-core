@@ -90,19 +90,27 @@ export function decay(state, now = Date.now()) {
   }
 }
 
+// 刻意不放单字「牛」「乐」：中文没有词边界，单字规则会命中
+// 「牛肉」「音乐」「可乐」，把吃午饭和听歌判成被夸和讲笑话。
+// 宁可漏掉一句单字夸，也不误伤日常名词。
 const RULES = [
-  { kind: 'praise', match: /谢谢|感谢|厉害|牛|不错|好用|最最最好|夸你|爱你/i, valence: 0.15, arousal: 0.05 },
-  { kind: 'scold', match: /废物|垃圾|干死|傻|滚|妈的|烦死|闭嘴/i, valence: -0.2, arousal: 0.1 },
+  { kind: 'praise', match: /谢谢|感谢|厉害|牛逼|真牛|太牛|牛啊|牛呀|不错|好用|最最最好|夸你|爱你/i, valence: 0.15, arousal: 0.05 },
+  { kind: 'scold', match: /废物|垃圾|干死|傻[逼瓜]|滚蛋|滚开|妈的|烦死|闭嘴/i, valence: -0.2, arousal: 0.1 },
   { kind: 'affection', match: /摸摸|亲亲|抱抱|啵啵|揉揉|贴贴|想你/i, valence: 0.1, arousal: 0.15 },
   { kind: 'serious', match: /帮我|请问|故障|报错|崩溃|怎么解决|拜托/i, valence: 0.05, arousal: -0.1 },
-  { kind: 'casual', match: /哈哈|乐|笑死|摸鱼|打游戏|炉石/i, valence: 0.05, arousal: 0.1 },
+  { kind: 'casual', match: /哈哈|笑死|笑嘻|摸鱼|打游戏|炉石|乐死|逗乐|乐呵/i, valence: 0.05, arousal: 0.1 },
 ]
 
 /** 用规则表把一条用户消息映射成事件；无匹配返回 null。 */
 export function classify(text) {
   const t = String(text || '')
   for (const r of RULES) {
-    if (r.match.test(t)) return { kind: r.kind, valence: r.valence, arousal: r.arousal }
+    const m = r.match.exec(t)
+    if (!m) continue
+    // 命中位置前两个字里出现否定词就不算这条情绪：「我不感谢你」不该让 valence 上涨
+    const before = t.slice(Math.max(0, m.index - 2), m.index)
+    if (/[不没别未无]/.test(before)) continue
+    return { kind: r.kind, valence: r.valence, arousal: r.arousal }
   }
   return null
 }

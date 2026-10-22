@@ -675,12 +675,15 @@ export function apply(ctx, config = {}) {
 
           // P2: 用用户消息更新情感状态（规则表 + 去重）
           try {
-            const st = decay(loadState(cfg.stateFile))
+            const raw = loadState(cfg.stateFile)
+            const st = decay(raw)
             const ev = classify(query)
             if (ev) {
               const eventId = 'msg:' + crypto.createHash('sha1').update(query).digest('hex').slice(0, 12)
               saveState(cfg.stateFile, applyEvent(st, { ...ev, eventId }))
-            } else {
+            } else if (st !== raw) {
+              // decay 在 1 小时内原样返回同一个对象。没有事件、也没到衰减窗口时
+              // 不写盘 —— 以前这里每轮无条件落盘一次，纯写放大。
               saveState(cfg.stateFile, st)
             }
           } catch {

@@ -13,6 +13,14 @@ import {
   getLastError,
 } from '../affect.mjs'
 
+// 子串误伤：单字规则曾经把日常名词判成情绪事件
+assert.equal(classify('今天吃牛肉'), null, '牛肉不是夸奖')
+assert.equal(classify('我在听音乐'), null, '音乐不是讲笑话')
+assert.equal(classify('可口可乐'), null, '可乐不是讲笑话')
+
+// 否定窗：「我不感谢你」不该让 valence 上涨
+assert.equal(classify('我不感谢你'), null)
+
 assert.equal(classify('谢谢你').kind, 'praise')
 assert.equal(classify('你个废物').kind, 'scold')
 assert.equal(classify('摸摸鱼鱼').kind, 'affection')

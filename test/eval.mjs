@@ -1,4 +1,6 @@
 import fs from 'node:fs'
+import path from 'node:path'
+import { recall as prodRecall } from '../index.js'
 
 const STOP = new Set([
   '用户', '我的', '什么', '怎么', '这个', '那个', '就是', '还是', '可以', '已经',
@@ -27,11 +29,28 @@ function splitEntries(text, src) {
   return out
 }
 
-const root = 'D:/dsh-workspace/memory'
+// 路径走环境变量，换机器不用改源码；都没有就报错退出，不许算出一堆 NaN 还报绿。
+// 另外从当前目录向上找一层：在插件目录里跑 npm test 时，档案其实在工作区根上。
+function findUp(name, start = process.cwd()) {
+  let dir = start
+  for (let i = 0; i < 4; i += 1) {
+    const candidate = path.join(dir, name)
+    if (fs.existsSync(candidate)) return candidate
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return null
+}
+
+const root =
+  process.env.DSH_MEMORY_ROOT || findUp('memory') || path.join(process.cwd(), 'memory')
+const dialogueFile =
+  process.env.DSH_MEMORY_DIALOGUE || findUp('对话记录.md') || path.join(process.cwd(), '对话记录.md')
 const entries = [
-  ...splitEntries(readText('D:/dsh-workspace/对话记录.md'), 'dialogue'),
-  ...splitEntries(readText(root + '/日记.md'), 'diary'),
-  ...splitEntries(readText(root + '/生长/状态.md'), 'state'),
+  ...splitEntries(readText(dialogueFile), 'dialogue'),
+  ...splitEntries(readText(path.join(root, '日记.md')), 'diary'),
+  ...splitEntries(readText(path.join(root, '生长', '状态.md')), 'state'),
 ]
 
 const byId = new Map()
@@ -157,9 +176,45 @@ function evaluate(fn, name) {
     '|', ms + 'ms',
   )
   for (const d of negDetail) console.log('     ', d)
+  return {
+    rec1: positives.length ? h1 / positives.length : 0,
+    rec3: positives.length ? h3 / positives.length : 0,
+    negHits,
+    ms,
+  }
+}
+
+// 没有语料就明确失败。以前这里会算成 0/0 = NaN，打印一排 NaN% 然后 exit 0，
+// 于是「测试全绿」变成一句空话 —— 在别人机器上它压根没测任何东西。
+if (entries.length === 0 || positives.length === 0) {
+  console.error(
+    `eval: 没有可用语料（entries=${entries.length}, positives=${positives.length}）。\n` +
+      '设置 DSH_MEMORY_ROOT / DSH_MEMORY_DIALOGUE，或在含「对话记录.md」的目录下运行。',
+  )
+  process.exit(1)
 }
 
 console.log('entries:', entries.length, '| positives:', positives.length)
 evaluate(recallA, 'A')
 evaluate(recallB, 'B')
 evaluate(recallC, 'C')
+
+// P 组才是生产实现：直接调 index.js 的 recall。前面三组只是实验对照，不算数。
+const prodCfg = {
+  dialogueFile,
+  memoryRoot: root,
+  structuredFile: process.env.DSH_MEMORY_STRUCTURED || path.join(root, '记忆', 'structured.jsonl'),
+  autocaptureStore: process.env.DSH_MEMORY_AUTOCAPTURE || null,
+  topK: 3,
+  minCoverage: 0.2,
+  minMatched: 2,
+  minRatio: 0.3,
+  halfLifeDays: 30,
+}
+const recallProd = (q, topK = 3) => prodRecall({ ...prodCfg, topK }, q, Date.now() + 1000)
+const prod = evaluate(recallProd, 'P')
+
+if (!Number.isFinite(prod.rec1) || prod.rec1 < 0.5) {
+  console.error(`eval: 生产实现 rec@1 = ${(prod.rec1 * 100).toFixed(1)}%，低于 50% 底线。`)
+  process.exit(1)
+}
