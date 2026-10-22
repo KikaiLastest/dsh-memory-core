@@ -6,7 +6,7 @@ import { classify, applyEvent, decay, loadState, saveState, toneHint } from './a
 import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
 import { autoCapture, readCaptureStore } from './autocapture.mjs'
 import { buildNav, summarizeDialogue } from './summary.mjs'
-import { idOf, loadStatusMap, isRecallable } from './status.mjs'
+import { idOf, loadStatusMap, isRecallable, resolveEntryStatus, filterRecallableEntries, titleFingerprint } from './status.mjs'
 import {
   fieldDescriptors,
   groupDescriptors,
@@ -115,7 +115,7 @@ function readJsonl(file) {
   return out
 }
 
-function loadEntries(cfg) {
+function loadEntries(cfg, deadline = Infinity) {
   const sources = [
     ['dialogue', cfg.dialogueFile],
     ['diary', path.join(cfg.memoryRoot, '日记.md')],
@@ -124,6 +124,7 @@ function loadEntries(cfg) {
   ]
   const entries = []
   for (const [src, file] of sources) {
+    if (Date.now() > deadline) return entries
     if (!file) continue
     let mtime = null
     try {
@@ -134,6 +135,7 @@ function loadEntries(cfg) {
 
   // 同时也读取 autocapture 独立文件中的记忆记录（如有）
   if (cfg.autocaptureStore && fs.existsSync(cfg.autocaptureStore)) {
+    if (Date.now() > deadline) return entries
     const captured = readCaptureStore(cfg.autocaptureStore)
     for (const c of captured) {
       if (c && c.text && c.text.length >= 5) {
@@ -156,20 +158,20 @@ function loadEntries(cfg) {
   // 否则同一段内容会被召回两次。顺带让「我不吃香菜」这类短偏好也能被搜到——
   // 它们本来被 40 字门槛挡在门外，而摘要层没有这个门槛。
   if (cfg.summaryStore && fs.existsSync(cfg.summaryStore)) {
-    // 去重指纹用标题，不用 source_id 里的行号。
+    if (Date.now() > deadline) return entries
+    // 去重指纹用统一的标题指纹，不用 source_id 里的行号。
     // summaries.jsonl 记的是生成摘要那一刻的行号，对话记录一被编辑就整体漂移：
     // 那时 covered.has('dialogue:20') 会落空，本来已经原样进池的长小节，
     // 会被它的旧摘要再顶进来一份，白占 topK 名额。
-    const titleKey = (t) => norm(String(t || '').replace(/^#+\s*/, ''))
     const covered = new Set()
     for (const e of entries) {
       if (e.src !== 'dialogue') continue
-      const key = titleKey(e.text.split('\n')[0] || '')
+      const key = titleFingerprint(e.text)
       if (key) covered.add(key)
     }
     for (const s of readJsonl(cfg.summaryStore)) {
       if (!s || !s.title) continue
-      if (covered.has(titleKey(s.title))) continue
+      if (covered.has(titleFingerprint(s.title))) continue
       const text = s.summary ? s.title + '\n' + s.summary : s.title
       if (text.length < 6) continue
       entries.push({
@@ -278,64 +280,38 @@ function cacheKey(cfg) {
     .join('|')
 }
 
-function loadCached(cfg) {
+function loadCached(cfg, deadline = Infinity) {
   const key = cacheKey(cfg)
   if (cache.key === key) return cache
-  const entries = loadEntries(cfg)
+  if (Date.now() > deadline) {
+    return { key: '', entries: [], model: { idf: new Map(), avgdl: 1 }, byId: new Map(), gramIndex: new Map(), suppressed: 0, idDrift: 0, timedOut: true }
+  }
+  const entries = loadEntries(cfg, deadline)
+  if (Date.now() > deadline) {
+    return { key: '', entries: [], model: { idf: new Map(), avgdl: 1 }, byId: new Map(), gramIndex: new Map(), suppressed: 0, idDrift: 0, timedOut: true }
+  }
 
-  // 状态过滤：被取代 / 归档 / 草稿不进候选池（仍留在档案里供追溯）
+  // 状态过滤：统一收口至 status.mjs 的 filterRecallableEntries，
+  // 对 degraded 状态表执行保守防御过滤（杜绝坏表放行被淘汰历史）
   const statusStore = loadStatusMap(cfg)
-  // 状态表读不出来时系统仍在跑，但淘汰过滤是失效的。这种降级必须说出来，
-  // 不能让「我不知道这条记忆有没有被淘汰」悄悄等于「它还有效」。
   if (statusStore.degraded && !warnedDegraded) {
     warnedDegraded = true
     console.warn(
-      `[dsh-memory-core] 状态表不可用（${statusStore.reason}），本轮召回没有应用淘汰过滤`,
+      `[dsh-memory-core] 状态表不可用（${statusStore.reason}），本轮召回启用保守淘汰过滤防御`,
     )
   }
-  const { bySourceId, byContentId } = statusStore
-  let suppressed = 0
-  let idDrift = 0
-  const recallable = []
-  for (const entry of entries) {
-    // 内容身份（完整文本哈希）优先：行号会因编辑漂移，内容不会。
-    // 行号只在内容身份没命中时用来发现「这条记忆被改过了」——
-    // 此时不套用旧状态，因为旧记录描述的是另一段文本。
-    const contentStatus = byContentId.get(idOf(entry.text))
-    let status = contentStatus
-    // 摘要条目带着原文的内容哈希：摘要文本本身压缩过、哈希必然对不上，
-    // 但原文那条记忆的身份还在，靠它就能查到「已经被淘汰了」
-    if (status === undefined && entry.contentId) status = byContentId.get(entry.contentId)
-    // 摘要条目的文本是压缩过的，内容哈希必然对不上原文，改用它的来源位置查。
-    // 早期版本把 source_id 写成「对话记录.md#L123」，和生产格式对不上，
-    // 这里两种都认，免得旧档案里的摘要集体失忆。
-    if (status === undefined && entry.sourceId) {
-      status = bySourceId.get(entry.sourceId)
-      if (status === undefined) {
-        const legacy = /#L(\d+)$/.exec(entry.sourceId)
-        if (legacy) status = bySourceId.get('dialogue:' + legacy[1])
-      }
-    }
-    if (status === undefined && bySourceId.has(entry.id)) {
-      idDrift += 1
-      status = undefined
-    }
-
-    if (!isRecallable(status)) {
-      suppressed += 1
-      continue
-    }
-    recallable.push(entry)
-  }
+  const { recallable, suppressed, unverified, idDrift } = filterRecallableEntries(entries, statusStore, {
+    conservative: true,
+  })
 
   const byId = new Map()
   const gramIndex = new Map()
+  let buildCount = 0
   for (const entry of recallable) {
+    if ((buildCount++ & 63) === 0 && Date.now() > deadline) {
+      return { key: '', entries: [], model: { idf: new Map(), avgdl: 1 }, byId: new Map(), gramIndex: new Map(), suppressed, idDrift, timedOut: true }
+    }
     const tf = new Map()
-    // 一遍扫完：同时累计词频和建倒排。
-    // 以前先 grams() 生成数组、再遍历建 tf、再 new Set 去重建倒排，
-    // 同一条文本被完整走了三遍，157 条语料上这就是冷启动的主要开销。
-    // 这里顺便把 grams() 内联掉，省掉每条文本一个 500 元素的中间数组。
     const text = norm(entry.text)
     for (let i = 0; i < text.length - 1; i += 1) {
       const g = text.slice(i, i + 2)
@@ -356,23 +332,35 @@ function loadCached(cfg) {
     entry.len = text.length
     byId.set(entry.id, entry)
   }
-  cache = { key, entries: recallable, model: buildModel(recallable), byId, gramIndex, suppressed, idDrift }
+
+  cache = {
+    key,
+    entries: recallable,
+    model: buildModel(recallable),
+    byId,
+    gramIndex,
+    suppressed,
+    unverified,
+    idDrift,
+    degraded: statusStore.degraded,
+    timedOut: false,
+  }
   return cache
 }
 
 /**
- * 召回。deadline 是绝对时间戳（毫秒），到点就放弃剩余计算、返回已算出的结果。
- *
- * 为什么不用 Promise.race：整条链路是同步 IO + 同步打分，微任务永远抢在 setTimeout
- * 之前跑完，包装 promise 只能假装有超时，实际一秒都救不回来。真正的超时只能在
- * 计算内部自己检查——放弃扫描，而不是放弃等待。
+ * 召回。deadline 是绝对时间戳（毫秒），覆盖从冷启动到扫描排名的完整计算路径。
+ * 到点主动放弃剩余计算、返回已算出的结果，不挂死主线程。
  */
 export function recall(cfg, query, deadline = Infinity) {
   const qg = [...new Set(grams(query))]
   if (qg.length === 0) return []
-  const { entries, model, byId, gramIndex } = loadCached(cfg)
-  if (entries.length === 0) return []
   if (Date.now() > deadline) return []
+
+  const cached = loadCached(cfg, deadline)
+  const { entries, model, byId, gramIndex, timedOut } = cached
+  if (timedOut || entries.length === 0 || Date.now() > deadline) return []
+
   const candidates = new Set()
   for (const g of qg) {
     const ids = gramIndex.get(g)

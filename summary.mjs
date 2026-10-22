@@ -18,7 +18,8 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { readCaptureStore } from './autocapture.mjs'
 import { sanitize } from './sanitize.mjs'
-import { idOf, loadStatusMap, isRecallable } from './status.mjs'
+import { idOf, loadStatusMap, isRecallable, resolveEntryStatus } from './status.mjs'
+import { assertSafeWritePath, atomicWriteJson, realPathish } from './fs-safe.mjs'
 
 const MAX_MD_BYTES = 512 * 1024
 const MAX_SEEN = 5000
@@ -66,10 +67,7 @@ function readJson(file) {
 }
 
 function writeJsonAtomic(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  const tmp = file + '.tmp'
-  fs.writeFileSync(tmp, JSON.stringify(value), 'utf8')
-  fs.renameSync(tmp, file)
+  atomicWriteJson(file, value)
 }
 
 function clampInt(value, min, max, fallback) {
@@ -349,14 +347,16 @@ export function buildNav(cfg = {}, options = {}) {
 
   // 导航和召回共用同一套状态判定：已经不参与召回的小节，也不该出现在常驻导航里。
   // 否则一条被淘汰的旧决策会从「召回」这个口子消失，又从「导航」那个口子回去。
-  const { bySourceId, byContentId } = loadStatusMap(cfg)
+  const statusMap = loadStatusMap(cfg)
   const entries = collectEntries(cfg, mdFiles).filter((entry) => {
-    if (entry.source !== 'dialogue') return true // 日记/捕获没有结构化状态，保持原样
-    // 和 recall 同一个查法：先认内容身份，行号只是兜底。
-    // 只查行号的话，原文一编辑、行号一漂移，被淘汰的旧决策就会从导航这个口子溜回来。
-    const byContent = byContentId.get(idOf(entry.text))
-    if (byContent !== undefined) return isRecallable(byContent)
-    return isRecallable(bySourceId.get('dialogue:' + entry.line))
+    // 统一调用 status.mjs 的权威状态解析，覆盖内容身份与行号兜底，并支持降级保守控制
+    const status = resolveEntryStatus({
+      contentId: entry.contentId,
+      text: entry.text,
+      sourceId: entry.source === 'dialogue' ? 'dialogue:' + entry.line : null,
+      id: entry.source === 'dialogue' ? 'dialogue:' + entry.line : null,
+    }, statusMap)
+    return isRecallable(status, { degraded: statusMap.degraded, conservative: true })
   })
   if (entries.length === 0) {
     navCache.key = key
@@ -448,10 +448,17 @@ export function summarizeDialogue(cfg = {}, options = {}) {
   if (!dialogueFile) return { ok: false, reason: 'no_dialogue_file', added: 0 }
   if (!storePath) return { ok: false, reason: 'no_summary_store', added: 0 }
 
-  // 和自动捕获同一条规矩：摘要存档不许落进 memory/。
-  const normalizedStore = path.normalize(path.resolve(storePath)).replace(/\\/g, '/')
+  // 和自动捕获同一条规矩：摘要存档不许落进 memory/（解开软链并对称防御）。
+  const normalizedStore = realPathish(storePath).replace(/\\/g, '/')
   if (/(?:^|\/)memory(?:\/|$)/i.test(normalizedStore)) {
     return { ok: false, reason: 'forbidden_memory_store', added: 0 }
+  }
+  if (cfg.memoryRoot) {
+    try {
+      assertSafeWritePath(storePath, cfg.memoryRoot)
+    } catch {
+      return { ok: false, reason: 'forbidden_memory_store', added: 0 }
+    }
   }
 
   const now = Number(options.now) || Date.now()

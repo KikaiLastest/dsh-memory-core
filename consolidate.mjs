@@ -3,6 +3,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import { idOf } from './status.mjs'
+import { atomicWriteJson } from './fs-safe.mjs'
 
 export { idOf }
 
@@ -118,8 +119,7 @@ export function consolidate({
   }
 
   // 水位目录也要建：之前写死路径时这里可能不存在，写完的记录下次会被当成没处理过
-  fs.mkdirSync(path.dirname(watermarkFile), { recursive: true })
-  fs.writeFileSync(watermarkFile, JSON.stringify({ ids: [...processed], updatedAt: now.toISOString() }, null, 2), 'utf8')
+  atomicWriteJson(watermarkFile, { ids: [...processed], updatedAt: now.toISOString() }, 2)
 
   return {
     pending: pending.length,

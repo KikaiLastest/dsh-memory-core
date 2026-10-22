@@ -252,7 +252,18 @@ export function normalizeConfig(raw) {
   for (const f of FIELD_DEFS) {
     const value = src[f.key]
     if (f.type === 'boolean') {
-      out[f.key] = value === undefined || value === null ? f.default : Boolean(value)
+      if (typeof value === 'boolean') {
+        out[f.key] = value
+      } else if (typeof value === 'string') {
+        const lower = value.trim().toLowerCase()
+        if (lower === 'true' || lower === '1') out[f.key] = true
+        else if (lower === 'false' || lower === '0') out[f.key] = false
+        else out[f.key] = f.default
+      } else if (typeof value === 'number') {
+        out[f.key] = value !== 0
+      } else {
+        out[f.key] = f.default
+      }
       continue
     }
     if (f.type === 'string') {
