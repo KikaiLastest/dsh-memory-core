@@ -18,7 +18,7 @@ import { consolidate } from '../consolidate.mjs'
  *   3) 按 GATE 把 abstain 的注入块从消息列表里摘掉，断言摘掉之后确实没有注入。
  *
  * 所以它验证的是门本身（verdict=abstain ⇒ 不注入），不是「当前主路径已经接好了」。
- * 实施说明与取舍（含开发集代价）见 docs/ABSTAIN-INTEGRATION.md。
+ * 实施说明与取舍（含开发集代价）见 docs/INTEGRATIONS.md。
  */
 
 // verdict -> 注入策略。answer / ambiguous 都该继续注入：

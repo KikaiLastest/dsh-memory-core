@@ -170,8 +170,9 @@ npm run consolidate      # 跑一次固化（幂等）
 
 ## 设计文档
 
+- [docs/README.md](docs/README.md)：文档索引——先看这张表再决定读哪篇
 - [docs/DESIGN.md](docs/DESIGN.md)：设计推导——问题、约束、四个推导、被否决的方案
-- [docs/PLAN.md](docs/PLAN.md)：实施路线（外部评估摘要）——分阶段交付、验收标准与当前实现对应
+- [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)：弃答 / 内容身份 / 状态过滤三处接入
 - [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md)：哲学迷思——中文房间、哲学僵尸、记忆与人格同一性
 
 ## 设计取舍

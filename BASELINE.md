@@ -65,7 +65,7 @@
 | 过期事实泄漏 | 3 |
 | 无答案误召 | 2 |
 
-详见 `docs/FAILURE-ANALYSIS.md`。
+详见 `docs/archive/FAILURE-ANALYSIS.md`。
 
 ## 已知阻塞项（本轮要修的）
 
