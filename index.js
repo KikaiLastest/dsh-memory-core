@@ -8,6 +8,7 @@ import { autoCapture, readCaptureStore } from './autocapture.mjs'
 import { buildNav, summarizeDialogue } from './summary.mjs'
 import { idOf, loadStatusMap, isRecallable, resolveEntryStatus, filterRecallableEntries, titleFingerprint } from './status.mjs'
 import { expandWords } from './syn.mjs'
+import { decide } from './abstain.mjs'
 import {
   fieldDescriptors,
   groupDescriptors,
@@ -511,6 +512,31 @@ export function recall(cfg, query, deadline = Infinity) {
         h.rawScore >= rtop.rawScore * 0.5,
     )
     .slice(0, 1)
+}
+
+/**
+ * 检索 + 可用性判定。
+ *
+ * recall() 只负责「找到了什么」；这个函数再回答「找到的东西能不能拿去用」。
+ * 分成两个导出而不是塞进 recall，是因为现有调用方（注入、面板、测试）
+ * 要的是纯召回列表，多一层 verdict 会破坏它们的假设。
+ *
+ * 返回值里的 hits 和 recall() 完全一致；额外字段：
+ *   verdict          answer | ambiguous | abstain
+ *   reason           判定依据，调试和审计用
+ *   evidenceStrength 启发式证据强度（0–1）。
+ *                    **不是**校准过的概率，别把它当成「有 82% 概率正确」。
+ */
+export function recallWithVerdict(cfg, query, deadline = Infinity) {
+  const hits = recall(cfg, query, deadline)
+  const d = decide(hits, query, cfg)
+  return {
+    hits,
+    verdict: d.verdict,
+    reason: d.reason,
+    // 只暴露 evidenceStrength，不暴露 confidence 那个容易误读的名字
+    evidenceStrength: d.evidenceStrength,
+  }
 }
 
 function buildBlock(hits) {

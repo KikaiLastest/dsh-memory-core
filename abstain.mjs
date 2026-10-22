@@ -125,7 +125,15 @@ export function decide(hits, query, cfg = {}) {
 
   const grams = gramCount(query)
 
-  const abstain = (reason) => ({ verdict: VERDICT.ABSTAIN, confidence: 0, reason })
+  // evidenceStrength 是**启发式证据强度**，不是概率校准后的置信度。
+  // 「0.82」不代表「82% 概率正确」——它只是覆盖率、命中数、密度的加权组合。
+  // confidence 保留为同名字段，纯粹为了不破坏已有调用；新代码请用 evidenceStrength。
+  const abstain = (reason) => ({
+    verdict: VERDICT.ABSTAIN,
+    evidenceStrength: 0,
+    confidence: 0,
+    reason,
+  })
 
   // 1) 归一化候选：丢掉不能参与比较的条目，按分数从高到低排。
   //    不信任调用方的顺序，排序是这里唯一的事实来源。
@@ -181,17 +189,21 @@ export function decide(hits, query, cfg = {}) {
   const strength = evidenceStrength(cov, matched, density, minCoverage, minMatched)
 
   if (margin < marginLimit) {
+    const s = round3(0.25 + 0.35 * strength)
     return {
       verdict: VERDICT.AMBIGUOUS,
-      confidence: round3(0.25 + 0.35 * strength),
+      evidenceStrength: s,
+      confidence: s,
       reason: REASON.CLOSE_CANDIDATES,
     }
   }
 
+  // 分差越大越敢下结论；单候选时 margin = 1，不打折
+  const s = round3((0.35 + 0.65 * strength) * (0.85 + 0.15 * margin))
   return {
     verdict: VERDICT.ANSWER,
-    // 分差越大越敢下结论；单候选时 margin = 1，不打折
-    confidence: round3((0.35 + 0.65 * strength) * (0.85 + 0.15 * margin)),
+    evidenceStrength: s,
+    confidence: s,
     reason: REASON.STRONG_EVIDENCE,
   }
 }
