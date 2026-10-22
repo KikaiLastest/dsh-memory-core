@@ -11,6 +11,18 @@
  *   ambiguous  有候选且证据也不差，但分不出主次 —— 调用方仍该展示候选，只是别当定论
  *   abstain    没有可信答案 —— 调用方应该直说不知道，而不是硬答
  *
+ * 【命中 ≠ 回答】
+ * 硬门槛只看 matched / coverage / density，它们衡量的是「查询词在条目里出现了多少」，
+ * 不是「条目有没有回答问题」。红队实测：问「备份用的移动硬盘是什么牌子的」命中的是
+ * 「重要的文档每周日自动备份到移动硬盘」（提到了移动硬盘，但一个牌子也没说），
+ * 覆盖率 0.33、命中 4 个 bigram，硬门槛照样放行。所以过线之后还要再问一次：
+ * 命中的那句话，回答的是不是被问的那个东西。
+ *   1. 属性问句（牌子/型号/版本/端口/多少/多久…）—— 命中里要么出现这个属性词，
+ *      要么在命中的子句里出现对应的值形态（数字、大写标识、路径、引号、频率词）；
+ *   2. 拉丁术语（GIL / Redis / AOF…）—— 查询点名的术语，命中里必须出现。
+ *      改写可以换中文说法，但不会把一个专有名词换掉，所以缺席就是没回答。
+ * 两项都不做词频统计，只看「出现/缺席」，所以不引入新的调参旋钮。
+ *
  * 【为什么不用绝对分数阈值】
  * score = BM25 × 时间衰减，量纲跟着语料规模、查询长度、条目长度一起变：
  * 同一个 13 分，在 4 字查询上是碾压，在 14 字查询上只是及格。
@@ -38,6 +50,9 @@ export const ABSTAIN_DEFAULTS = Object.freeze({
   // 归一化密度下限；默认 0 = 关闭。真实语料的密度下界受条目长度影响，
   // 没有放之四海的间隔，需要时按语料自行设。
   minDensity: 0,
+  // 答案证据检查（属性对齐 + 拉丁术语覆盖）。默认开；
+  // 关掉等于退回「只看命中词」的旧行为，留给需要逐字复现旧判定的调用方。
+  answerEvidence: true,
 })
 
 export const VERDICT = Object.freeze({
@@ -52,6 +67,9 @@ export const REASON = Object.freeze({
   WEAK_MATCHED: 'weak-matched',
   WEAK_COVERAGE: 'weak-coverage',
   WEAK_DENSITY: 'weak-density',
+  ATTRIBUTE_UNANSWERED: 'attribute-unanswered',
+  TERM_UNANSWERED: 'term-unanswered',
+  EVIDENCE_ELSEWHERE: 'evidence-elsewhere',
   CLOSE_CANDIDATES: 'close-candidates',
   STRONG_EVIDENCE: 'strong-evidence',
 })
@@ -106,6 +124,133 @@ function evidenceStrength(cov, matched, density, minCoverage, minMatched) {
   return 0.4 * covRatio + 0.4 * matchedRatio + 0.2 * densityRatio
 }
 
+
+/** 查询问的是哪一类属性；kind 决定「答案应该长什么样」。 */
+const ATTRIBUTE_ASKS = Object.freeze([
+  // 名称类：答案必须是一个「名字」，光有数字不算（24 寸的显示器不回答「什么牌子」）
+  { word: '牌子', kind: 'name' },
+  { word: '品牌', kind: 'name' },
+  { word: '型号', kind: 'name' },
+  { word: '名字', kind: 'name' },
+  // 编码类：答案通常是数字、路径或英文标识
+  { word: '版本', kind: 'code' },
+  { word: '端口', kind: 'code' },
+  { word: '路径', kind: 'code' },
+  { word: '目录', kind: 'code' },
+  { word: '地址', kind: 'code' },
+  { word: '编号', kind: 'code' },
+  // 数量 / 频次：答案应该是一个数、中文数词或频率词
+  { word: '多少', kind: 'quantity' },
+  { word: '几个', kind: 'quantity' },
+  { word: '几集', kind: 'quantity' },
+  { word: '几点', kind: 'quantity' },
+  { word: '多久', kind: 'quantity' },
+  { word: '多大', kind: 'quantity' },
+  { word: '几岁', kind: 'quantity' },
+  { word: '什么时候', kind: 'quantity' },
+])
+
+// 文本已经小写化，所以英文标识按 [a-z]{2,} 认，不能再写 [A-Z]。
+const LATIN_VALUE = /[a-z]{2,}|["“”'‘’「」]/
+const CODE_VALUE = /\d|[a-z]{2,}|[\\/][\w.-]+|["“”'‘’「」]/
+const QUANTITY_VALUE = /[每第隔半]|\d|[一二三四五六七八九十百千万亿两]/
+const NAME_VALUE = /叫[^的了是，。]{1,6}/
+// 「提到了这回事，但没给出答案」的状态词：端口还没定、品牌待定……
+const PENDING = /还没|没定|没确认|待定|未定|不确定|再说|等.{0,4}(确认|定)/
+
+function normalizeText(s) {
+  return String(s ?? '')
+    .replace(/\s+/g, '')
+    .toLowerCase()
+}
+
+/** 正文切成子句。Markdown 标题行不是句子，混进来会把标题当成答案。 */
+function contentClauses(text) {
+  const body = String(text ?? '')
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#{1,6}\s/.test(line))
+    .join(' ')
+  return body
+    .split(/[。！？；，、：,;!?:]+/)
+    .map(normalizeText)
+    .filter(Boolean)
+}
+
+/** 命中子句：与查询共享最多 bigram 的那一句；一个都没共享时返回 null。 */
+function bestClause(clauses, grams) {
+  let best = null
+  let bestHits = 0
+  for (const clause of clauses) {
+    let n = 0
+    for (const g of grams) if (clause.includes(g)) n += 1
+    if (n > bestHits) {
+      best = clause
+      bestHits = n
+    }
+  }
+  return best
+}
+
+/** 查询里点名的拉丁术语。改写不会换掉专有名词，所以缺席就是没回答。 */
+function latinTerms(query) {
+  const stop = new Set(['the', 'and', 'for', 'with', 'how', 'what', 'is', 'are', 'to', 'of', 'in', 'on'])
+  const out = []
+  for (const raw of String(query ?? '').match(/[A-Za-z][A-Za-z0-9_+.-]*/g) || []) {
+    const w = raw.toLowerCase().replace(/[.+_-]+$/, '')
+    if (w.length < 2 || stop.has(w)) continue
+    if (!out.includes(w)) out.push(w)
+  }
+  return out
+}
+
+/** 命中里有没有真的提到被问的那个属性（没问属性时恒为真）。 */
+function mentionsAttribute(hit, query) {
+  const text = normalizeText(hit?.entry?.text)
+  const q = normalizeText(query)
+  const ask = ATTRIBUTE_ASKS.find((a) => q.includes(a.word))
+  if (!ask) return true
+  const asksName = /叫什么|叫啥|名字/.test(q)
+  return text.includes(ask.word) || (asksName && NAME_VALUE.test(text))
+}
+
+/**
+ * 答案证据检查：命中的内容回答的是被问的东西吗。
+ *
+ * 返回 null 表示没发现缺口（也包括「拿不到正文」——判断不了时宁可放行，
+ * 不能因为调用方没传 entry.text 就把所有候选都拒掉）；否则返回拒答理由。
+ */
+function answerEvidenceGap(hit, query) {
+  const text = normalizeText(hit?.entry?.text)
+  if (!text) return null
+  const q = normalizeText(query)
+  const grams = []
+  for (let i = 0; i < q.length - 1; i += 1) {
+    const g = q.slice(i, i + 2)
+    if (!grams.includes(g)) grams.push(g)
+  }
+  const clauses = contentClauses(hit.entry.text)
+  const clause = bestClause(clauses, grams)
+
+  // 1) 属性问句：属性词或被问出来的值，至少要有一个真的在命中里。
+  const ask = ATTRIBUTE_ASKS.find((a) => q.includes(a.word))
+  if (ask) {
+    const asksName = /叫什么|叫啥|名字/.test(q)
+    const attributeMentioned = text.includes(ask.word) || (asksName && NAME_VALUE.test(text))
+    const shape = ask.kind === 'name' ? LATIN_VALUE : ask.kind === 'code' ? CODE_VALUE : QUANTITY_VALUE
+    const answerShaped = clause != null && shape.test(clause)
+    const attrClause = clauses.find((c) => c.includes(ask.word)) || null
+    const pending = attrClause != null && PENDING.test(attrClause)
+    if (attributeMentioned && !answerShaped && pending) return REASON.ATTRIBUTE_UNANSWERED
+    if (!attributeMentioned && !answerShaped) return REASON.ATTRIBUTE_UNANSWERED
+  }
+
+  // 2) 拉丁术语：查询点名的术语必须出现在命中里。
+  for (const term of latinTerms(query)) {
+    if (!text.includes(term)) return REASON.TERM_UNANSWERED
+  }
+  return null
+}
+
 /**
  * 判断一组召回候选该不该被当作答案拿出来。
  *
@@ -124,6 +269,8 @@ export function decide(hits, query, cfg = {}) {
   const minMatched = num(options.minMatched, ABSTAIN_DEFAULTS.minMatched)
   const marginLimit = num(options.margin, ABSTAIN_DEFAULTS.margin)
   const minDensity = num(options.minDensity, ABSTAIN_DEFAULTS.minDensity)
+  // 只有显式写 false 才关：省略、undefined、NaN 都按默认开，避免调用方漏传就静默放宽判定。
+  const answerEvidence = options.answerEvidence !== false
 
   const grams = gramCount(query)
 
@@ -178,6 +325,32 @@ export function decide(hits, query, cfg = {}) {
   const density = densityOf(top.hit, grams)
   if (minDensity > 0 && density < minDensity) return abstain(REASON.WEAK_DENSITY)
 
+  const strength = evidenceStrength(cov, matched, density, minCoverage, minMatched)
+
+  // 2.5) 词面过了线，再问一句「这段话回答的是被问的那个问题吗」。
+  //      顺序放在分差之前：命中都没回答问题，就不存在「该不该纠结有两个候选」。
+  //      top1 答不上来时先别急着拒：候选里如果还有一条真的答上了，那是排序问题
+  //      （该降级成 ambiguous，把候选摆出来），不是「没有答案」。
+  if (answerEvidence) {
+    const gap = answerEvidenceGap(top.hit, query)
+    if (gap) {
+      const alternative = candidates.slice(1).some((item) => {
+        const m = queryMatchedOf(item.hit)
+        const c = coverageOf(item.hit)
+        if (m < minMatched || c < minCoverage) return false
+        // 属性问句还要求那条候选真的提到被问的属性：
+        // 「24 寸的显示器」能把「什么牌子」判过线，但它不是牌子的答案。
+        return mentionsAttribute(item.hit, query) && answerEvidenceGap(item.hit, query) == null
+      })
+      if (!alternative) return abstain(gap)
+      return {
+        verdict: VERDICT.AMBIGUOUS,
+        evidenceStrength: round3(0.25 + 0.35 * strength),
+        reason: REASON.EVIDENCE_ELSEWHERE,
+      }
+    }
+  }
+
   // 3) 证据过线了，再看有没有「证据同样够、分数却咬得很紧」的竞争者。
   //    噪声候选不能制造 ambiguous —— 那会把「选不准」和「有噪声」混为一谈。
   let margin = 1
@@ -188,8 +361,6 @@ export function decide(hits, query, cfg = {}) {
     const runnerViable = runnerMatched >= minMatched && runnerCov >= minCoverage
     if (runnerViable) margin = clamp01((top.score - runner.score) / top.score)
   }
-
-  const strength = evidenceStrength(cov, matched, density, minCoverage, minMatched)
 
   if (margin < marginLimit) {
     const s = round3(0.25 + 0.35 * strength)
