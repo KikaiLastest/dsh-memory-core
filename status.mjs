@@ -234,6 +234,7 @@ export function loadStatusMap(cfg = {}) {
   let syntaxErrors = 0
   let schemaErrors = 0
   let totalLines = 0
+  let danglingRefs = 0
 
   for (const line of text.split('\n')) {
     if (!line.trim()) continue
@@ -248,19 +249,23 @@ export function loadStatusMap(cfg = {}) {
 
     // 严格契约校验：
     // 1. 必须是对象且包含合法字符串 id 与 source_id
-    // 2. 状态值如果存在，必须落在合法枚举集合中；非法枚举不能被伪装成合法放行
-    // 3. 避免同一个文件内相同 id 发生非预期覆盖冲突
+    // 2. status 状态契约收敛：
+    //    - 若缺失或为 null，按向后兼容迁移策略赋以明确的 'active' 确定状态；
+    //    - 若为合法枚举字符串，保留其值；
+    //    - 若为非法枚举值或非字符串类型，坚决计入 schemaErrors 并触发降级保护。
+    // 3. 拦截重复 ID 冲突（相同内容 ID 重复声明）
+    // 4. 拦截自身替代 (supersedes === id)
     if (!rec || typeof rec !== 'object' || typeof rec.id !== 'string' || !rec.id.trim() || typeof rec.source_id !== 'string' || !rec.source_id.trim()) {
       schemaErrors += 1
       continue
     }
 
-    let status = null
+    let status = 'active'
     if (rec.status !== undefined && rec.status !== null) {
       if (typeof rec.status === 'string' && VALID_STATUSES.has(rec.status)) {
         status = rec.status
       } else {
-        // 非法 status 枚举值计入契约错误
+        // 非法枚举或非法类型（数字、数组等）
         schemaErrors += 1
         continue
       }
@@ -271,17 +276,25 @@ export function loadStatusMap(cfg = {}) {
       continue
     }
 
+    if (rec.supersedes && rec.supersedes === rec.id) {
+      schemaErrors += 1 // 自我替代逻辑悖论
+      continue
+    }
+
     records.push({ rec, status })
     byMemId.set(rec.id, rec)
     bySourceId.set(rec.source_id, status)
     byContentId.set(rec.id, status)
   }
 
-  // 关系链覆盖：无论记录本身标什么，只要被任何记录 supersedes 指向，强制置为 superseded
+  // 关系链覆盖与引用完整性
   for (const { rec } of records) {
     if (!rec.supersedes) continue
     const target = byMemId.get(rec.supersedes)
-    if (!target) continue
+    if (!target) {
+      danglingRefs += 1
+      continue
+    }
     if (target.source_id) bySourceId.set(target.source_id, 'superseded')
     if (target.id) byContentId.set(target.id, 'superseded')
   }
@@ -302,6 +315,7 @@ export function loadStatusMap(cfg = {}) {
     totalLines,
     syntaxErrors,
     schemaErrors,
+    danglingRefs,
     brokenLines: badLines,
   }
 }
