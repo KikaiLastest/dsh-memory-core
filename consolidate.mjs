@@ -85,7 +85,9 @@ export function consolidate({ dialogueFile, outputFile, watermarkFile, now = new
       status: 'active',
       supersedes: null,
       created_at: now.toISOString(),
-      confidence: 1.0,
+      // 规则抽取（标题当事实）不产生可信度估计。写死 1.0 会把「切分成功」
+      // 伪装成「事实已确定」，这里如实留空，等真做了 LLM 抽取再填。
+      confidence: null,
     })
     processed.add(id)
   }

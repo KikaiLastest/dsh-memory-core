@@ -163,5 +163,41 @@ const driftText = driftHits.map((h) => h.entry.text).join('\n')
 assert.ok(!driftText.includes('方案 A'), '行号漂移后被取代的记录仍然不该召回（内容签名兜底）')
 assert.ok(driftText.includes('方案 C'), '当前有效的方案 C 仍然召回')
 
+// ── 9. 长文本：超过 200 原始字符 + 大量空白，漂移后状态仍然生效 ─────────
+// 这条专门盯一个曾经的错：早先用「归一化后截 200 字」当内容签名，
+// 而 structured.jsonl 存的是「先截 200 字再归一化」的 quote，两边不是同一样东西，
+// 长段落直接对不上，行号一漂状态就全丢。现在改用完整内容的哈希作为身份。
+const longSection =
+  '### 超长的一节\n\n' +
+  '这一节故意写得非常长，中间夹着许多换行与空格，用来制造超过两百字符的原始文本，\n' +
+  '同时还要保证它的内容和前面几节完全不同，避免和别的记忆撞在一起。\n'.repeat(6)
+fs.appendFileSync(dialogueFile, '\n' + longSection + '\n', 'utf8')
+consolidate({ dialogueFile, outputFile: structuredFile, watermarkFile })
+
+const recsLong = readRecs()
+const longRec = recsLong.find((r) => r.quote.includes('超长的一节'))
+assert.ok(longRec, '长小节已固化')
+assert.ok(longRec.quote.length === 200, 'quote 仍是 200 字截断')
+assert.ok(longRec.quote !== longSection.trim(), 'quote 确实是截断过的，不是全文')
+
+// 先把长小节标成 superseded，再由另一条记录指过来
+const longMarker = recsLong.find((r) => r.id !== longRec.id && r.status === 'active')
+assert.ok(longMarker, '需要一条 active 记录来做替代者')
+recsLong.find((r) => r.id === longRec.id).status = 'superseded'
+writeRecs(recsLong)
+assert.ok(
+  !recall(cfg, '超长的一节', Date.now() + 5000).map((h) => h.entry.text).join('\n').includes('超长的一节'),
+  '长文本被标记后不该召回',
+)
+
+// 再插一段开头内容让行号整体漂移，状态必须靠完整内容 ID 继续生效
+const drift2 = '## 2026-10-18\n\n### 又一次补写\n\n再把一段内容插到最前面，让所有小节的行号整体往后挪一次。\n\n'
+fs.writeFileSync(dialogueFile, drift2 + fs.readFileSync(dialogueFile, 'utf8'), 'utf8')
+consolidate({ dialogueFile, outputFile: structuredFile, watermarkFile })
+
+const afterLongDrift = recall(cfg, '超长的一节', Date.now() + 5000)
+const longHits = afterLongDrift.map((h) => h.entry.text).join('\n')
+assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，被取代的记录仍然不该召回')
+
 fs.rmSync(dir, { recursive: true, force: true })
 console.log('status tests passed')

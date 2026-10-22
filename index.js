@@ -6,6 +6,7 @@ import { classify, applyEvent, decay, loadState, saveState, toneHint } from './a
 import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
 import { autoCapture, readCaptureStore } from './autocapture.mjs'
 import { buildNav, summarizeDialogue } from './summary.mjs'
+import { idOf } from './consolidate.mjs'
 import {
   fieldDescriptors,
   groupDescriptors,
@@ -183,24 +184,13 @@ let cache = { key: '', entries: [], idf: null }
  * 关系优先于状态字段：即使某条记录自己写着 active，只要被别的记录 supersedes 指到，
  * 就当它已被取代 —— 手动改状态时漏掉一半，是这类系统最常见的坏数据。
  */
-/**
- * 记忆的文本签名：用归一化后的前 200 字算，
- * 和 consolidate 里 quote 的取法一致（s.text.slice(0, 200)）。
- *
- * 存在的理由：source_id 是 "dialogue:行号"，往对话记录中间插一段，后面所有行号全漂，
- * 状态就白标了。签名跟着内容走，行号怎么变都还能对上。
- */
-function textKey(text) {
-  return crypto.createHash('sha1').update(norm(String(text || '')).slice(0, 200)).digest('hex').slice(0, 16)
-}
-
 function loadStatusMap(cfg) {
   const bySourceId = new Map()
-  const byText = new Map()
+  const byContentId = new Map()
   const file = cfg.structuredFile
-  if (!file) return { bySourceId, byText }
+  if (!file) return { bySourceId, byContentId }
   const text = readText(file)
-  if (!text) return { bySourceId, byText }
+  if (!text) return { bySourceId, byContentId }
 
   const byMemId = new Map()
   const records = []
@@ -217,7 +207,10 @@ function loadStatusMap(cfg) {
     records.push({ rec, status })
     byMemId.set(rec.id, rec)
     bySourceId.set(rec.source_id, status)
-    if (rec.quote) byText.set(textKey(rec.quote), status)
+    // 内容身份用完整文本的哈希（和 consolidate 的 idOf 同一套算法），
+    // 不要用 quote 前缀算 —— quote 是 s.text 的 200 字截断，
+    // 先去空白再截和先截再去空白结果不同，长文本会直接对不上。
+    if (rec.id) byContentId.set(rec.id, status)
   }
 
   // 第二遍才有完整 byMemId，supersedes 可能指向后面才出现的记录
@@ -226,9 +219,9 @@ function loadStatusMap(cfg) {
     const target = byMemId.get(rec.supersedes)
     if (!target) continue
     if (target.source_id) bySourceId.set(target.source_id, 'superseded')
-    if (target.quote) byText.set(textKey(target.quote), 'superseded')
+    if (target.id) byContentId.set(target.id, 'superseded')
   }
-  return { bySourceId, byText }
+  return { bySourceId, byContentId }
 }
 
 /** 只有 active 参与召回；缺 status 的旧记录按兼容策略保留。 */
@@ -265,15 +258,20 @@ function loadCached(cfg) {
   const entries = loadEntries(cfg)
 
   // 状态过滤：被取代 / 归档 / 草稿不进候选池（仍留在档案里供追溯）
-  const { bySourceId, byText } = loadStatusMap(cfg)
+  const { bySourceId, byContentId } = loadStatusMap(cfg)
   let suppressed = 0
+  let idDrift = 0
   const recallable = []
   for (const entry of entries) {
-    // 先按行号对；行号漂了（对话记录被编辑过）再按内容签名对。
-    // 两者都没有 = 这条没标过状态，按 active 处理。
-    let status
-    if (bySourceId.has(entry.id)) status = bySourceId.get(entry.id)
-    else status = byText.get(textKey(entry.text))
+    // 内容身份（完整文本哈希）优先：行号会因编辑漂移，内容不会。
+    // 行号只在内容身份没命中时用来发现「这条记忆被改过了」——
+    // 此时不套用旧状态，因为旧记录描述的是另一段文本。
+    const contentStatus = byContentId.get(idOf(entry.text))
+    let status = contentStatus
+    if (status === undefined && bySourceId.has(entry.id)) {
+      idDrift += 1
+      status = undefined
+    }
 
     if (!isRecallable(status)) {
       suppressed += 1
@@ -299,7 +297,7 @@ function loadCached(cfg) {
       set.add(entry.id)
     }
   }
-  cache = { key, entries: recallable, idf: buildIdf(recallable), byId, gramIndex, suppressed }
+  cache = { key, entries: recallable, idf: buildIdf(recallable), byId, gramIndex, suppressed, idDrift }
   return cache
 }
 
