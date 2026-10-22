@@ -220,11 +220,19 @@ function loadCached(cfg) {
   return cache
 }
 
-function recall(cfg, query) {
+/**
+ * 召回。deadline 是绝对时间戳（毫秒），到点就放弃剩余计算、返回已算出的结果。
+ *
+ * 为什么不用 Promise.race：整条链路是同步 IO + 同步打分，微任务永远抢在 setTimeout
+ * 之前跑完，包装 promise 只能假装有超时，实际一秒都救不回来。真正的超时只能在
+ * 计算内部自己检查——放弃扫描，而不是放弃等待。
+ */
+export function recall(cfg, query, deadline = Infinity) {
   const qg = [...new Set(grams(query))]
   if (qg.length === 0) return []
   const { entries, idf, byId, gramIndex } = loadCached(cfg)
   if (entries.length === 0) return []
+  if (Date.now() > deadline) return []
   const candidates = new Set()
   for (const g of qg) {
     const ids = gramIndex.get(g)
@@ -238,7 +246,10 @@ function recall(cfg, query) {
   const hits = []
   const now = Date.now()
   const halfLife = cfg.halfLifeDays ?? 30
+  let scanned = 0
   for (const entry of pool) {
+    // 每 64 条查一次表：比逐条 Date.now() 便宜，又足够细粒度
+    if ((scanned++ & 63) === 0 && Date.now() > deadline) break
     const s = scoreEntry(qg, entry, idf, now, halfLife)
     if (s.score > 0) {
       hits.push({
@@ -317,17 +328,6 @@ function appendLog(file, record) {
   } catch {
     /* logging is best-effort */
   }
-}
-
-function withTimeout(promise, ms, fallback) {
-  return Promise.race([
-    promise,
-    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
-  ])
-    .catch(() => fallback)
-    .finally(() => {
-      /* timer 由 race 自行清理 */
-    })
 }
 
 function textOf(message) {
@@ -665,11 +665,7 @@ export function apply(ctx, config = {}) {
             return decision
           }
           const started = Date.now()
-          const hits = await withTimeout(
-            Promise.resolve().then(() => recall(cfg, query)),
-            cfg.timeoutMs,
-            [],
-          )
+          const hits = recall(cfg, query, started + cfg.timeoutMs)
           const ms = Date.now() - started
           if (!Array.isArray(hits) || hits.length === 0) {
             appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: [], ms, injected: false })
