@@ -174,6 +174,53 @@ function scoreEntry(queryGrams, entry, idf, now = Date.now(), halfLifeDays = 30)
 
 let cache = { key: '', entries: [], idf: null }
 
+/**
+ * 读固化产物的状态表：source_id -> status。
+ *
+ * structured.jsonl 的 source_id 形如 "dialogue:123"，和 splitEntries 生成的 entry.id 完全对应，
+ * 所以不需要把固化记录再当一遍语料，直接按 id 对齐就能让状态生效。
+ *
+ * 关系优先于状态字段：即使某条记录自己写着 active，只要被别的记录 supersedes 指到，
+ * 就当它已被取代 —— 手动改状态时漏掉一半，是这类系统最常见的坏数据。
+ */
+function loadStatusMap(cfg) {
+  const map = new Map()
+  const file = cfg.structuredFile
+  if (!file) return map
+  const text = readText(file)
+  if (!text) return map
+
+  const byId = new Map()
+  const records = []
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    let rec
+    try {
+      rec = JSON.parse(line)
+    } catch {
+      continue // 单行损坏不该让整张状态表失效
+    }
+    if (!rec || !rec.source_id) continue
+    records.push(rec)
+    byId.set(rec.id, rec.source_id)
+    map.set(rec.source_id, typeof rec.status === 'string' ? rec.status : null)
+  }
+
+  // 第二遍才有完整 byId，supersedes 可能指向后面才出现的记录
+  for (const rec of records) {
+    if (!rec.supersedes) continue
+    const target = byId.get(rec.supersedes)
+    if (target && target !== rec.source_id) map.set(target, 'superseded')
+  }
+  return map
+}
+
+/** 只有 active 参与召回；缺 status 的旧记录按兼容策略保留。 */
+function isRecallable(status) {
+  if (status === null || status === undefined) return true
+  return status === 'active'
+}
+
 function cacheKey(cfg) {
   const files = [
     cfg.dialogueFile,
@@ -181,6 +228,7 @@ function cacheKey(cfg) {
     path.join(cfg.memoryRoot, '生长', '状态.md'),
     path.join(cfg.memoryRoot, '生长', '生长记录.md'),
     cfg.autocaptureStore,
+    cfg.structuredFile,
   ].filter(Boolean)
 
   return files
@@ -199,9 +247,22 @@ function loadCached(cfg) {
   const key = cacheKey(cfg)
   if (cache.key === key) return cache
   const entries = loadEntries(cfg)
+
+  // 状态过滤：被取代 / 归档 / 草稿不进候选池（仍留在档案里供追溯）
+  const statusMap = loadStatusMap(cfg)
+  let suppressed = 0
+  const recallable = []
+  for (const entry of entries) {
+    if (!isRecallable(statusMap.get(entry.id))) {
+      suppressed += 1
+      continue
+    }
+    recallable.push(entry)
+  }
+
   const byId = new Map()
   const gramIndex = new Map()
-  for (const entry of entries) {
+  for (const entry of recallable) {
     const gs = grams(entry.text)
     const tf = new Map()
     for (const g of gs) tf.set(g, (tf.get(g) || 0) + 1)
@@ -216,7 +277,7 @@ function loadCached(cfg) {
       set.add(entry.id)
     }
   }
-  cache = { key, entries, idf: buildIdf(entries), byId, gramIndex }
+  cache = { key, entries: recallable, idf: buildIdf(recallable), byId, gramIndex, suppressed }
   return cache
 }
 
@@ -355,6 +416,10 @@ export function apply(ctx, config = {}) {
     minRatio: typeof config.minRatio === 'number' && config.minRatio > 0 ? config.minRatio : 0.3,
     minScore: typeof config.minScore === 'number' && config.minScore > 0 ? config.minScore : 0.02,
     stateFile: config.stateFile || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'affect', 'state.json'),
+    // 固化产物默认跟着档案根走，和 consolidate.mjs 的输出位置一致
+    structuredFile:
+      config.structuredFile ||
+      path.join(normalizeConfig(config).memoryRoot, '记忆', 'structured.jsonl'),
   }
 
   // ── 后台总结 ────────────────────────────────────────────────────────────
