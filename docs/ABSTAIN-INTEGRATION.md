@@ -183,7 +183,7 @@ node test/abstain-preflight.mjs
 回归命令（数字不应变化，因为门不改召回）：
 
 ```bash
-node scripts/quality-frozen.mjs   # 期望仍是 48.1 / 49.6 / 0.489 / 8.3%
+node scripts/quality-frozen.mjs   # 对照 BASELINE.md 的「当前值」一节，不要用本文件写死的数字
 npm test
 ```
 
