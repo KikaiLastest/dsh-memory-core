@@ -282,7 +282,12 @@ function scoreEntry(
     // 名字才说得清每个数到底是什么。
     rawScore: preDecayScore,
     queryScore,
+    // 扩展候选分，**还没截断**
     expansionScore,
+    // 真正加进总分的扩展分。触发上限时它小于 expansionScore，
+    // 所以 preDecayScore 恒等于 queryScore + effectiveExpansionScore，
+    // 而不是 queryScore + expansionScore——三个数必须能对上账。
+    effectiveExpansionScore: effectiveExpansion,
     preDecayScore,
     weight,
     coverage,
@@ -439,6 +444,11 @@ export function recall(cfg, query, deadline = Infinity) {
           entry,
           score: s.score,
           rawScore: s.rawScore,
+          // 分数分解必须一起带出去，否则调用方拿到 preDecayScore 也没法对账
+          queryScore: s.queryScore,
+          expansionScore: s.expansionScore,
+          effectiveExpansionScore: s.effectiveExpansionScore,
+          preDecayScore: s.preDecayScore,
           weight: s.weight,
           coverage: s.coverage,
           matched: s.matched,

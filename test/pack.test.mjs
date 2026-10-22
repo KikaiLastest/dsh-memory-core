@@ -139,10 +139,42 @@ try {
     assert.ok(fs.existsSync(path.join(pkgDir, file)), `tarball 里缺 ${file}`)
   }
 
-  // 从解出来的目录加载一次，这是用户安装后的真实路径
+  // 从解出来的目录加载一次
   const installed = await import(pathToFileURL(path.join(pkgDir, pkg.main)).href)
   assert.equal(typeof installed.apply, 'function', '安装产物里的入口没导出 apply')
   assert.equal(typeof installed.recall, 'function', '安装产物里的入口没导出 recall')
+
+  // 真正的安装验证：建一个干净消费者项目，把 tarball 装进去，
+  // 然后**按包名**导入。上面那个 import 走的是绝对文件路径，
+  // 绕过了 npm 的包解析和 exports 字段——而用户遇到的恰恰是那一层。
+  const consumer = path.join(tmp, 'consumer')
+  fs.mkdirSync(consumer)
+  fs.writeFileSync(
+    path.join(consumer, 'package.json'),
+    JSON.stringify({ name: 'consumer', private: true, type: 'module' }, null, 2),
+  )
+  const installArgs = ['install', '--no-audit', '--no-fund', '--ignore-scripts', '--no-save', tarball]
+  execFileSync(
+    process.platform === 'win32' ? 'cmd.exe' : 'npm',
+    process.platform === 'win32' ? ['/c', 'npm', ...installArgs] : installArgs,
+    { cwd: consumer, stdio: 'ignore', timeout: 120000 },
+  )
+  fs.writeFileSync(
+    path.join(consumer, 'probe.mjs'),
+    [
+      "import * as pkg from 'dsh-memory-core'",
+      "if (typeof pkg.apply !== 'function') { console.error('probe: apply 不可用'); process.exit(1) }",
+      "if (typeof pkg.recall !== 'function') { console.error('probe: recall 不可用'); process.exit(1) }",
+      "console.log('ok')",
+      '',
+    ].join('\n'),
+  )
+  const probeOut = execFileSync(process.execPath, ['probe.mjs'], {
+    cwd: consumer,
+    encoding: 'utf8',
+    timeout: 60000,
+  })
+  assert.ok(probeOut.includes('ok'), '干净安装后按包名导入公开入口失败')
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })
 }
