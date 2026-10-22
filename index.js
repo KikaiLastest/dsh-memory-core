@@ -4,7 +4,7 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { classify, applyEvent, decay, loadState, saveState, toneHint } from './affect.mjs'
 import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
-import { autoCapture, readCaptureStore } from './autocapture.mjs'
+import { autoCapture, readCaptureStore, toCaptureEntry } from './autocapture.mjs'
 import { buildNav, summarizeDialogue } from './summary.mjs'
 import { idOf, loadStatusMap, isRecallable, resolveEntryStatus, filterRecallableEntries, titleFingerprint } from './status.mjs'
 import { expandWords } from './syn.mjs'
@@ -142,16 +142,10 @@ function loadEntries(cfg, deadline = Infinity) {
     const captured = readCaptureStore(cfg.autocaptureStore)
     for (const c of captured) {
       if (c && c.text && c.text.length >= 5) {
-        entries.push({
-          id: c.id || ('captured:' + crypto.createHash('sha1').update(c.text).digest('hex').slice(0, 8)),
-          src: c.source || 'autocapture',
-          line: 0,
-          text: c.text,
-          weight: c.weight !== undefined ? c.weight : 1.0,
-          createdAt: c.created_at || c.createdAt || null,
-          created_at: c.created_at || c.createdAt || null,
-          permanent: Boolean(c.permanent),
-        })
+        // 必须走 toCaptureEntry 投影：它会给捕获副本补上规范正文身份（contentId/bodyId/sourceId）。
+        // 直接构造对象字面量会让副本三层身份全落空，状态查询返回 null，
+        // 而健康状态表下 null 被当作可召回 —— 后果是已淘汰的旧结论从捕获通道原样回来。
+        entries.push(toCaptureEntry(c, entries))
       }
     }
   }
