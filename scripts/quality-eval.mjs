@@ -1,11 +1,24 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { recall } from '../index.js'
 import { consolidate } from '../consolidate.mjs'
+import {
+  FAILURE_KINDS,
+  auditCases,
+  buildReport,
+  digestCases,
+  emitReport,
+  formatMetrics,
+  gitMeta,
+  parseJsonTarget,
+  printReportTail,
+  scoreCases,
+} from './eval-report.mjs'
 
 /**
- * 独立召回质量评测。
+ * 独立召回质量评测（开发集）。
  *
  * 和 scripts/benchmark-latency.mjs 的分工：
  * - benchmark 量的是「快不快」，用合成语料测延迟；
@@ -13,7 +26,14 @@ import { consolidate } from '../consolidate.mjs'
  *
  * 样本和期望值一律手写在这里，不从实现里推导，也不由算法自己给自己打分。
  * 覆盖的对抗场景：新旧决策覆盖 / 否定表达 / 关键词重合但语义无关 / 语料里没有答案。
+ *
+ * 警告：12 条样本，而且样本是实现写好之后补的——它是回归看门狗，不是泛化证据。
+ * 只有 scripts/quality-frozen.mjs 的 157 条能说明召回能力。指标口径与冻结集共用
+ * scripts/eval-report.mjs，两边同名指标分母一致。
  */
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const root = path.dirname(here)
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-'))
 const memoryRoot = path.join(dir, 'memory')
@@ -76,70 +96,94 @@ const cases = [
   { q: '今天股市怎么样', expect: null, forbid: [] },
 ]
 
-let hit1 = 0
-let hit3 = 0
-let mrrSum = 0
-let staleHits = 0
-let noAnswerFp = 0
-const failures = []
+const scored = scoreCases({
+  cases,
+  recallFn: (q, topK) => recall({ ...cfg, topK }, q, Date.now() + 5000),
+  topK: cfg.topK,
+})
 
-for (const c of cases) {
-  const hits = recall(cfg, c.q, Date.now() + 5000)
-  const texts = hits.map((h) => h.entry.text)
+const corpusText = ['## 2026-10-22', ''].concat(corpus.map(([t, b]) => '### ' + t + '\n\n' + b)).join('\n')
+const labelAudit = auditCases(cases, corpusText)
+const gm = gitMeta(root)
+const jsonTarget = parseJsonTarget(process.argv.slice(2), 'quality-eval.mjs')
 
-  // 过期记忆是否漏回来：这条不计入 recall，单独算 stale
-  const stale = c.forbid.filter((f) => texts.some((t) => t.includes(f)))
-  if (stale.length) {
-    staleHits += 1
-    failures.push(`[STALE] ${c.q} -> 不该出现的: ${stale.join(', ')}`)
-  }
+const warnings = [
+  '开发集只有 ' + cases.length + ' 条，且是实现写完后补的样本：过拟合，不能作为泛化证据',
+  '指标口径与冻结集共用 scripts/eval-report.mjs，同名指标分母一致；无答案用例不计入 Recall 分母',
+]
+if (gm.dirty) warnings.push('工作区有未提交改动 (' + gm.dirtyFiles + ' 个文件)，这次数字对应的不是干净的 commit')
 
-  if (c.expect === null) {
-    if (hits.length > 0) {
-      noAnswerFp += 1
-      failures.push(`[NOANSWER-FP] ${c.q} -> 本该空召回，实际命中 ${texts.length} 条`)
-    }
-    continue
-  }
+const report = buildReport({
+  tool: 'scripts/quality-eval.mjs',
+  kind: 'dev',
+  datasetId: 'dev-' + cases.length,
+  datasetPath: path.relative(root, fileURLToPath(import.meta.url)).replace(/\\/g, '/'),
+  cases,
+  config: cfg,
+  scored,
+  integrity: {
+    ok: true, // 开发集允许随开发改样本，这里只留指纹方便对比，不设硬门禁
+    labelDigest: digestCases(cases),
+    samples: cases.length,
+    answerable: scored.counts.answerable,
+    unanswerable: scored.counts.unanswerable,
+    labelAudit,
+  },
+  warnings,
+})
+report.git = gm
 
-  const rank = texts.findIndex((t) => t.includes(c.expect))
-  if (rank === 0) hit1 += 1
-  if (rank >= 0 && rank < 3) hit3 += 1
-  if (rank >= 0) mrrSum += 1 / (rank + 1)
-  if (rank < 0) failures.push(`[MISS] ${c.q} -> 期望包含「${c.expect}」，实际: ${texts.map((t) => t.slice(0, 12)).join(' | ') || '(空)'}`)
+const pct = (v) => (v === null ? 'n/a' : (v * 100).toFixed(1) + '%')
+const answerable = scored.counts.answerable
+const unanswerable = scored.counts.unanswerable
+
+console.log('=== 召回质量报告（开发集 ' + cases.length + ' 条）===')
+console.log(
+  '有答案查询:' + answerable + ' | 无答案查询:' + unanswerable +
+    ' | 全部查询共返回 ' + scored.counts.totalHits + ' 条结果',
+)
+console.log('\n指标（分数 = 分子 / 分母；口径同冻结集）:')
+for (const line of formatMetrics(scored.metrics)) console.log('  ' + line)
+
+console.log('\n--- 失败构成（' + scored.failureEntries + ' 个条目）---')
+for (const key of Object.keys(FAILURE_KINDS)) {
+  if (!scored.byKind[key]) continue
+  console.log('  ' + FAILURE_KINDS[key].padEnd(34) + ' ' + String(scored.byKind[key]).padStart(3))
 }
 
-const answerable = cases.filter((c) => c.expect !== null).length
-const unanswerable = cases.length - answerable
-const pct = (n, d) => (d === 0 ? 'n/a' : ((n / d) * 100).toFixed(1) + '%')
-
-console.log('=== 召回质量报告 ===')
-console.log('有答案查询:', answerable, '| 无答案查询:', unanswerable)
-console.log('Recall@1      :', pct(hit1, answerable))
-console.log('Recall@3      :', pct(hit3, answerable))
-console.log('MRR           :', answerable === 0 ? 'n/a' : (mrrSum / answerable).toFixed(3))
-console.log('过期记忆漏回率:', pct(staleHits, cases.length))
-console.log('无答案误召率  :', pct(noAnswerFp, unanswerable))
-
-if (failures.length) {
+if (scored.failures.length) {
   console.log('\n--- 失败项 ---')
-  for (const f of failures) console.log(' ', f)
+  for (const f of scored.failures) {
+    if (f.kind === 'stale') console.log('  [stale] ' + f.query + ' -> 不该出现的: ' + f.detail.replace('不该出现: ', ''))
+    else if (f.kind === 'noAnswer') console.log('  [noAnswer] ' + f.query + ' -> ' + f.detail)
+    else if (f.kind === 'emptyRecall') console.log('  [emptyRecall] ' + f.query + ' -> 期望「' + f.expected + '」，返回 0 条')
+    else console.log('  [misrank] ' + f.query + ' -> 期望「' + f.expected + '」，实际: ' + (f.got.join(' | ') || '(空)'))
+  }
 }
+
+if (labelAudit.issues.length) {
+  console.log('\n--- 标签体检 ' + labelAudit.issues.length + ' 项 ---')
+  for (const i of labelAudit.issues) console.log('  [' + i.code + '] ' + i.query + ' :: ' + i.detail)
+}
+
+const jsonPath = emitReport(report, jsonTarget)
+printReportTail(jsonPath, report)
 
 try {
   fs.rmSync(dir, { recursive: true, force: true })
 } catch {}
 
 // 门禁：质量不达标就以非零码退出，别让它混进"全绿"
+// 阈值一个都没动，历史和文档里的四个条件原样保留。
 const strict = process.argv.includes('--strict')
 const ok =
-  hit1 / answerable >= 0.8 &&
-  hit3 / answerable >= 0.95 &&
-  staleHits === 0 &&
-  noAnswerFp === 0
+  scored.metrics.recallAt1.value >= 0.8 &&
+  scored.metrics.recallAt3.value >= 0.95 &&
+  scored.counts.staleQueries === 0 &&
+  scored.counts.noAnswerFp === 0
 
 if (!ok) {
-  console.error('\n质量门禁未通过（Recall@1 ≥ 80% / Recall@3 ≥ 95% / 过期漏回 = 0 / 无答案误召 = 0）')
+  console.error('\n质量门禁未通过（Recall@1 ≥ 80% / Recall@3 ≥ 95% / 污染查询 = 0 / 无答案误召 = 0）')
   if (strict) process.exit(1)
 }
 
