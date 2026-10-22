@@ -67,6 +67,19 @@ assert.ok(
   '长小节仍要由原文自己命中',
 )
 
+// 行号漂移：在对话记录开头插两行，长小节从第 7 行挪到第 9 行。
+// 摘要里记的还是 dialogue:7 —— 如果去重还按行号比，这份过期摘要就会被当成
+// 「没收录过」重新进池，和原文撞成两份镜像，白占 topK。
+const padded = '\n\n' + fs.readFileSync(dialogueFile, 'utf8')
+fs.writeFileSync(dialogueFile, padded, 'utf8')
+
+const drifted = recall(cfg, '倒排索引构建', Date.now() + 5000)
+const driftedIds = drifted.map((h) => h.entry.id)
+assert.ok(
+  !driftedIds.includes('sum-s2'),
+  '行号漂移之后，摘要仍不该重复进池，实际命中: ' + driftedIds.join(', '),
+)
+
 try {
   fs.rmSync(dir, { recursive: true, force: true })
 } catch {}

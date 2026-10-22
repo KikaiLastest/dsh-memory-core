@@ -156,13 +156,20 @@ function loadEntries(cfg) {
   // 否则同一段内容会被召回两次。顺带让「我不吃香菜」这类短偏好也能被搜到——
   // 它们本来被 40 字门槛挡在门外，而摘要层没有这个门槛。
   if (cfg.summaryStore && fs.existsSync(cfg.summaryStore)) {
+    // 去重指纹用标题，不用 source_id 里的行号。
+    // summaries.jsonl 记的是生成摘要那一刻的行号，对话记录一被编辑就整体漂移：
+    // 那时 covered.has('dialogue:20') 会落空，本来已经原样进池的长小节，
+    // 会被它的旧摘要再顶进来一份，白占 topK 名额。
+    const titleKey = (t) => norm(String(t || '').replace(/^#+\s*/, ''))
     const covered = new Set()
     for (const e of entries) {
-      if (e.src === 'dialogue') covered.add('dialogue:' + e.line)
+      if (e.src !== 'dialogue') continue
+      const key = titleKey(e.text.split('\n')[0] || '')
+      if (key) covered.add(key)
     }
     for (const s of readJsonl(cfg.summaryStore)) {
       if (!s || !s.title) continue
-      if (s.source_id && covered.has(s.source_id)) continue
+      if (covered.has(titleKey(s.title))) continue
       const text = s.summary ? s.title + '\n' + s.summary : s.title
       if (text.length < 6) continue
       entries.push({
