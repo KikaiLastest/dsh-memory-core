@@ -359,18 +359,36 @@ function loadCached(cfg, deadline = Infinity) {
     return { key: '', entries: [], model: { idf: new Map(), avgdl: 1 }, byId: new Map(), gramIndex: new Map(), suppressed: 0, idDrift: 0, timedOut: true }
   }
 
-  // 状态过滤：统一收口至 status.mjs 的 filterRecallableEntries，
-  // 对 degraded 状态表执行保守防御过滤（杜绝坏表放行被淘汰历史）
-  const statusStore = loadStatusMap(cfg)
-  if (statusStore.degraded && !warnedDegraded) {
-    warnedDegraded = true
-    console.warn(
-      `[dsh-memory-core] 状态表不可用（${statusStore.reason}），本轮召回启用保守淘汰过滤防御`,
-    )
+  // 状态过滤：统一收口至 status.mjs 的 filterRecallableEntries。
+  //
+  // 2026-10-22 起默认关闭（statusFilter: false）。
+  // 依据是真实使用数据：memory/记忆/structured.jsonl 的 157 条记录全部是 active，
+  // 从没有一条被标成 superseded/archived/draft。这套三层身份判定（显式 contentId →
+  // 内容哈希 → sourceId 坐标）在真实使用里从未被触发过，却在空转时引入了误伤风险：
+  // 弱身份按「正文前 48 字」匹配，会让开头相同但结论相反的记忆互相连坐。
+  //
+  // 关掉不等于删掉。代码完整保留，配置里把 statusFilter 设回 true 即可恢复。
+  // 想重新启用前，建议先确认状态表里确实有非 active 记录，否则就是重新引入空转。
+  const statusFilterEnabled = cfg.statusFilter === true
+  let recallable = entries
+  let suppressed = 0
+  let unverified = 0
+  let idDrift = 0
+  let statusStore = { degraded: false }
+  if (statusFilterEnabled) {
+    statusStore = loadStatusMap(cfg)
+    if (statusStore.degraded && !warnedDegraded) {
+      warnedDegraded = true
+      console.warn(
+        `[dsh-memory-core] 状态表不可用（${statusStore.reason}），本轮召回启用保守淘汰过滤防御`,
+      )
+    }
+    const filtered = filterRecallableEntries(entries, statusStore, { conservative: true })
+    recallable = filtered.recallable
+    suppressed = filtered.suppressed
+    unverified = filtered.unverified
+    idDrift = filtered.idDrift
   }
-  const { recallable, suppressed, unverified, idDrift } = filterRecallableEntries(entries, statusStore, {
-    conservative: true,
-  })
 
   const byId = new Map()
   const gramIndex = new Map()

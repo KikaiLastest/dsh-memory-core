@@ -52,6 +52,8 @@ const cfg = {
   minMatched: 2,
   minRatio: 0.3,
   halfLifeDays: 30,
+  // 状态过滤已默认关闭，本文件测的就是该机制，必须显式打开。
+  statusFilter: true,
 }
 
 const readRecs = () =>
@@ -448,6 +450,7 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
     minMatched: 1,
     minRatio: 0.1,
     halfLifeDays: 30,
+    statusFilter: true,
   }
   const readD = () =>
     fs.readFileSync(sfile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
@@ -555,6 +558,7 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
     halfLifeDays: 30,
     enableMemoryNav: true,
     enableSanitize: true,
+    statusFilter: true,
   }
 
   let drs = readD()

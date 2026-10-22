@@ -223,6 +223,9 @@ const cfg = {
   minMatched: 2,
   minRatio: 0.3,
   halfLifeDays: 30,
+  // 状态过滤默认关闭；本用例要验证「旧口径报的污染里有多少是真正的过期身份泄漏」，
+  // 必须让淘汰过滤生效才能测到，否则 superseded 条目会照常返回。
+  statusFilter: true,
 }
 const realCases = [
   { q: '现在用什么数据库', expect: 'MySQL 8', forbid: ['PostgreSQL'], scene: 'supersede' },

@@ -110,6 +110,9 @@ const cfg = {
   minMatched: 1,
   minRatio: 0,
   halfLifeDays: 30,
+  // 状态过滤 2026-10-22 起默认关闭（真实档案 157 条全 active，机制从未触发还在误伤）。
+  // 这个用例测的正是那套机制本身，所以必须显式打开，否则测不到东西。
+  statusFilter: true,
 }
 
 const hits = recall(cfg, doomed, Date.now() + 5000)

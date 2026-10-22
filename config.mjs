@@ -164,6 +164,14 @@ export const FIELD_DEFS = [
     group: 'capture',
   },
   {
+    key: 'statusFilter',
+    type: 'boolean',
+    default: false,
+    label: '状态过滤（淘汰记忆不召回）',
+    hint: '按状态表把 superseded/archived 挡在召回之外。默认关闭：真实档案 157 条全是 active，这套机制从未被触发，却在空转时按「正文前 48 字」弱身份误伤正常记忆。确认状态表里确实有非 active 记录后再打开。',
+    group: 'summary',
+  },
+  {
     key: 'enableMemoryNav',
     type: 'boolean',
     default: true,

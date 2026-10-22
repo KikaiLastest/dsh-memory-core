@@ -78,6 +78,9 @@ const cfg = {
   minMatched: 2,
   minRatio: 0.3,
   halfLifeDays: 30,
+  // 门禁跑的是「状态过滤开启」的完整能力：淘汰记忆不召回是契约的一部分，
+  // 标准不因生产默认为关闭而放松。生产默认值见 config.mjs 的 statusFilter。
+  statusFilter: true,
 }
 
 // 人工标注：expect 必须命中，forbid 一条都不许出现，expect 为空表示语料里没答案

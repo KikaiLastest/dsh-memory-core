@@ -79,6 +79,8 @@ const cfg = {
   minRatio: 0.1,
   enableMemoryNav: true,
   summaryMaxChars: 600,
+  // 状态过滤 2026-10-22 起默认关闭。本用例专测跨通道状态拦截，必须显式打开。
+  statusFilter: true,
 }
 
 // ── 测试用例 A: 标为 superseded ──────────────────────────────────────────

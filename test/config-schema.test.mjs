@@ -9,8 +9,9 @@ import {
   validatePatch,
 } from '../config.mjs'
 
-// 1. 表本身：16 个参数、key 不重复、字符串/数字/布尔都有范围或默认值
-assert.equal(FIELD_DEFS.length, 16, '16 个可调参数')
+// 1. 表本身：17 个参数、key 不重复、字符串/数字/布尔都有范围或默认值
+// （2026-10-22 新增 statusFilter；状态过滤默认关闭，理由见 config.mjs 里该字段的 hint）
+assert.equal(FIELD_DEFS.length, 17, '17 个可调参数')
 const keys = FIELD_DEFS.map((f) => f.key)
 assert.equal(new Set(keys).size, keys.length, 'key 不重复')
 for (const f of FIELD_DEFS) {

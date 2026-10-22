@@ -38,6 +38,7 @@ const cfgOf = (memoryRoot, dialogueFile, structuredFile) => ({
   minMatched: 2,
   minRatio: 0.3,
   halfLifeDays: 30,
+  statusFilter: true,
 })
 
 try {

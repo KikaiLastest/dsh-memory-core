@@ -71,6 +71,8 @@ apply(ctx, {
   topK: 2, // 故意设小：淘汰记录若先占名额，有效结果就会不足
   minCoverage: 0.2,
   minMatched: 2,
+  // 状态过滤已默认关闭；本用例测的正是「淘汰记录不占注入名额」，必须显式打开。
+  statusFilter: true,
   enableSummary: false,
   enableMemoryNav: false,
   enableAutoCapture: false,
