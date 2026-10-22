@@ -4,6 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { recall } from '../index.js'
 import { consolidate } from '../consolidate.mjs'
+import { createPollutionOracle } from './pollution-oracle.mjs'
 import {
   METRIC_DEFS,
   FAILURE_KINDS,
@@ -101,6 +102,14 @@ const patched = recs
   .map((r) => (SUPERSEDED.has(r.fact) ? { ...r, status: 'superseded' } : r))
 fs.writeFileSync(structuredFile, patched.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
 
+// 身份判定器：状态用上面刚打好的 superseded 标注，forbid 承载条目从语料小节静态构造。
+// 注意它只看「返回的是哪条记录」，不看返回文本里有没有禁用词。
+const oracle = createPollutionOracle({
+  dialogueText: corpusText,
+  records: patched,
+  staleStatuses: ['superseded', 'archived'],
+})
+
 const cfg = {
   memoryRoot,
   dialogueFile,
@@ -112,15 +121,38 @@ const cfg = {
   halfLifeDays: 30,
 }
 
+const recallDurations = []
 const scored = scoreCases({
   cases,
-  recallFn: (q, topK) => recall({ ...cfg, topK }, q, Date.now() + 5000),
+  recallFn: (q, topK) => {
+    const started = performance.now()
+    const hits = recall({ ...cfg, topK }, q, Date.now() + 5000)
+    recallDurations.push(performance.now() - started)
+    return hits
+  },
   topK: cfg.topK,
+  identity: oracle,
 })
+
+const sortedDurations = [...recallDurations].sort((a, b) => a - b)
+const percentile = (p) =>
+  sortedDurations.length === 0
+    ? null
+    : sortedDurations[Math.min(sortedDurations.length - 1, Math.floor(p * (sortedDurations.length - 1)))]
+const latency = {
+  samples: sortedDurations.length,
+  p50Ms: percentile(0.5),
+  p95Ms: percentile(0.95),
+  maxMs: sortedDurations.length ? sortedDurations[sortedDurations.length - 1] : null,
+}
 
 // 完整性：冻结集内容 + 阈值 + 评测侧的 prep 常量，任一漂移都说明基线和这次的数字不同卷。
 const measured = digestFrozenDir(fixtures)
-const harness = { superseded: [...SUPERSEDED].sort(), junkFacts: [...JUNK_FACTS].sort() }
+const harness = {
+  superseded: [...SUPERSEDED].sort(),
+  junkFacts: [...JUNK_FACTS].sort(),
+  pollutionOracle: { strategy: oracle.describe().strategy, staleStatuses: oracle.staleStatuses },
+}
 const integrityCheck = verifyFrozen(measured, cfg, harness)
 const labelAudit = auditCases(cases, corpusText)
 const gm = gitMeta(root)
@@ -134,6 +166,11 @@ if (labelAudit.counts['short-expect']) {
 warnings.push(
   '冻结集不设门禁：数字用于观察基线，不作通过条件；改动语料或阈值必须先跑 --rebaseline 并重新记录基线',
 )
+warnings.push(
+  '污染指标已拆成两个身份维度（过期身份泄漏率 / 内容污染率）；旧子串口径 staleQueryRate/staleHitShare 仅作对照，不参与门禁',
+)
+const oracleProblems = oracle.describe().problems
+if (oracleProblems.length) warnings.push('身份判定器有 ' + oracleProblems.length + ' 条对齐问题，详见报告 pollution.oracle.problems')
 
 const report = buildReport({
   tool: 'scripts/quality-frozen.mjs',
@@ -162,6 +199,11 @@ const report = buildReport({
   warnings,
 })
 report.git = gm
+report.latency = latency
+report.pollution = {
+  oracle: oracle.describe(),
+  audit: scored.pollutionAudit,
+}
 
 const pct = (v) => (v === null ? 'n/a' : (v * 100).toFixed(1) + '%')
 const fk = scored.byKind
@@ -172,21 +214,63 @@ console.log(
   '样本 ' + cases.length + ' 条（有答案 ' + scored.counts.answerable + ' / 无答案 ' + scored.counts.unanswerable + '）' +
     ' | 全部查询共返回 ' + scored.counts.totalHits + ' 条结果',
 )
-console.log('\n指标（分数 = 分子 / 分母，分母写在这里；实现见 scripts/eval-report.mjs METRIC_DEFS）:')
-for (const line of formatMetrics(scored.metrics)) console.log('  ' + line)
+console.log('\n指标（分数 = 分子 / 分母；新维度按条目身份判定，实现见 scripts/eval-report.mjs METRIC_DEFS）:')
+for (const line of formatMetrics(scored.metrics, { legacy: false })) console.log('  ' + line)
 
-console.log('\n--- 口径对照（同一个量在不同文档里的旧叫法）---')
-console.log('  受污染查询比例(旧)          = 污染查询率   = ' + scored.counts.staleQueries + '/' + cases.length)
-console.log('  过期结果占比(旧)            = 污染结果占比 = ' + scored.counts.staleResultRows + '/' + scored.counts.totalHits)
+const audit = scored.pollutionAudit
+console.log('\n--- 污染维度拆分（三个维度各自有分子/分母，不合并成单一「污染率」）---')
 console.log(
-  '  旧口径的「过期结果占比」分子用的是「命中的禁用词数」(' + scored.counts.staleTermHits + ') 而不是结果条数，' +
-    '单位不一致，已在本次统一为结果条数；旧算法值 = ' + pct(scored.counts.totalHits ? scored.counts.staleTermHits / scored.counts.totalHits : null),
+  '  过期身份泄漏率 : ' + pct(scored.metrics.staleIdentityLeakRate.value).padStart(6) +
+    ' = ' + scored.counts.staleIdentityRows + ' / ' + scored.counts.totalHits + ' 条结果' +
+    '；涉事查询 ' + scored.counts.staleIdentityQueries + ' 条（superseded/archived 被返回）',
 )
-console.log('  过期记忆漏回率(旧, 开发集)  = 污染查询率（同一个量，只是叫法不同）')
 console.log(
-  '  过期事实泄漏 3/4%(FAILURE-ANALYSIS) = 污染查询数 / 失败条目数 = ' +
-    scored.counts.staleQueries + '/' + failEntries +
-    ' = ' + pct(failEntries ? scored.counts.staleQueries / failEntries : null),
+  '  内容污染率     : ' + pct(scored.metrics.contentPollutionRate.value).padStart(6) +
+    ' = ' + scored.counts.contentPollutionRows + ' / ' + scored.counts.totalHits + ' 条结果' +
+    '；涉事查询 ' + scored.counts.contentPollutionQueries + ' 条（返回了 forbid 内容所属条目）',
+)
+console.log(
+  '  无答案误召率   : ' + pct(scored.metrics.noAnswerFpRate.value).padStart(6) +
+    ' = ' + scored.counts.noAnswerFp + ' / ' + scored.counts.unanswerable + ' 条查询',
+)
+console.log(
+  '  身份不可判定   : ' + scored.counts.unidentifiedHits + ' 条结果；状态未知 ' + scored.counts.unknownStatusHits +
+    ' 条（硬门禁检查前者，后者在报告里可见）',
+)
+
+if (audit.adjudicatedFalsePositives.length) {
+  console.log('\n--- 旧子串口径误报 ' + audit.adjudicatedFalsePositives.length + ' 条（按身份判为非污染）---')
+  for (const fp of audit.adjudicatedFalsePositives) {
+    console.log('  [' + fp.scene + '] ' + fp.query + ' :: 子串命中 ' + fp.forbid.join(', '))
+    for (const row of fp.rows) {
+      if (!row.matchedForbidRows) continue
+      console.log('     -> ' + (row.id || '?') + ' 状态=' + (row.status || 'unknown') + '，' + fp.reason)
+    }
+  }
+}
+console.log(
+  '\n  旧口径对照（已弃用，不参与门禁）: 污染查询率 ' +
+    pct(scored.metrics.staleQueryRate.value) + ' = ' + scored.counts.staleQueries + '/' + cases.length +
+    '；污染结果占比 ' + pct(scored.metrics.staleHitShare.value) + ' = ' + scored.counts.staleResultRows + '/' + scored.counts.totalHits,
+)
+console.log(
+  '  说明：旧口径的「过期结果占比」分子曾用命中的禁用词数(' + scored.counts.staleTermHits + ')，单位不一致；' +
+    '现在只保留结果条数口径做对照。',
+)
+
+const oracleDesc = oracle.describe()
+console.log('\n--- 身份判定器 ---')
+console.log('  条目 ' + oracleDesc.sections + '，有状态记录 ' + oracleDesc.recorded + '，状态分布 ' + JSON.stringify(oracleDesc.statusCounts))
+console.log('  已淘汰身份: ' + (oracleDesc.staleIds.join(', ') || '(无)'))
+if (oracleDesc.problems.length) {
+  console.log('  对齐问题 ' + oracleDesc.problems.length + ' 条（身份判定可能错位，需先修数据）:')
+  for (const problem of oracleDesc.problems.slice(0, 5)) console.log('   - ' + problem)
+}
+
+console.log('\n--- 延迟（同进程串行调用 ' + latency.samples + ' 次，含首次冷启动）---')
+console.log(
+  '  p50 ' + latency.p50Ms.toFixed(2) + 'ms | p95 ' + latency.p95Ms.toFixed(2) +
+    'ms | max ' + latency.maxMs.toFixed(2) + 'ms',
 )
 
 console.log('\n--- 失败构成（' + failEntries + ' 个条目，可多条叠加在同一条查询上）---')
@@ -205,6 +289,8 @@ if (scored.failures.length) {
   for (const f of scored.failures) {
     const head = '  [' + f.kind + '][' + f.scene + '] ' + f.query
     if (f.kind === 'stale') console.log(head + ' -> ' + f.detail)
+    else if (f.kind === 'staleIdentity') console.log(head + ' -> ' + f.detail)
+    else if (f.kind === 'contentPollution') console.log(head + ' -> ' + f.detail)
     else if (f.kind === 'noAnswer') console.log(head + ' -> ' + f.detail)
     else if (f.kind === 'emptyRecall') console.log(head + ' -> 期望「' + f.expected + '」，返回 0 条')
     else console.log(head + ' -> 期望「' + f.expected + '」，实际: ' + (f.got.join(' | ') || '(空)'))
