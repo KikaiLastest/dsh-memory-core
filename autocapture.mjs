@@ -187,7 +187,9 @@ export function autoCapture(options) {
     id,
     type: 'auto_capture',
     text: storedText,
-    weight: Math.max(0, Math.min(1, Number(initialWeight) || 1.0)),
+    // 用 isFinite 判断而不是 ||：initialWeight = 0 是合法的「不参与召回」，
+    // 用 || 会把它悄悄改成 1.0，和之前情感状态吞掉 arousal=0 是同一个错误模式
+    weight: Math.max(0, Math.min(1, Number.isFinite(Number(initialWeight)) ? Number(initialWeight) : 1.0)),
     permanent: Boolean(permanent),
     created_at: createdAt,
     source,

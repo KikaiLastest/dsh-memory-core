@@ -204,6 +204,9 @@ function parseMarkdown(text, source, fallbackAt = null) {
         at: date ? Date.parse(date + 'T00:00:00') || fallbackAt || 0 : fallbackAt || 0,
         date,
         line: current.line,
+        // 小节原文。摘要记录会带上它的内容哈希，这样即使标题被改、行号漂移，
+        // 召回时也能靠内容身份找到「这条记忆是不是已经被淘汰了」。
+        raw: current.raw.join('\n').trim(),
       })
     }
     current = null
@@ -219,10 +222,13 @@ function parseMarkdown(text, source, fallbackAt = null) {
         current = null
         continue
       }
-      current = { title, body: [], line: i + 1 }
+      current = { title, body: [], line: i + 1, raw: [lines[i]] }
       continue
     }
-    if (current) current.body.push(lines[i])
+    if (current) {
+      current.body.push(lines[i])
+      current.raw.push(lines[i])
+    }
   }
   flush()
   return out
@@ -503,7 +509,12 @@ export function summarizeDialogue(cfg = {}, options = {}) {
       summary,
       keywords: (section.keywords || []).map((keyword) => (redact ? sanitize(keyword) : keyword)),
       source: 'dialogue',
-      source_id: `${path.basename(dialogueFile)}#L${section.line}`,
+      // 必须和 consolidate.mjs 写进 structured.jsonl 的格式一致（dialogue:行号），
+      // 否则召回时拿它去状态表里查永远查不到，被淘汰原文的摘要会重新进池。
+      // 早期版本这里写的是「对话记录.md#L123」，读取端保留了兼容。
+      source_id: `dialogue:${section.line}`,
+      // 原文内容身份：和 consolidate.mjs 写进 structured.jsonl 的 id 同一套算法
+      content_id: section.raw ? idOf(section.raw) : null,
       created_at: at,
       day: at.slice(0, 10),
     }

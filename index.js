@@ -178,6 +178,7 @@ function loadEntries(cfg) {
         line: 0,
         // 摘要不是原文，内容哈希对不上；靠它自己的来源位置去查状态
         sourceId: s.source_id || null,
+        contentId: s.content_id || null,
         text,
         weight: 1.0,
         createdAt: s.created_at || null,
@@ -291,8 +292,19 @@ function loadCached(cfg) {
     // 此时不套用旧状态，因为旧记录描述的是另一段文本。
     const contentStatus = byContentId.get(idOf(entry.text))
     let status = contentStatus
-    // 摘要条目的文本是压缩过的，内容哈希必然对不上原文，改用它的来源位置查
-    if (status === undefined && entry.sourceId) status = bySourceId.get(entry.sourceId)
+    // 摘要条目带着原文的内容哈希：摘要文本本身压缩过、哈希必然对不上，
+    // 但原文那条记忆的身份还在，靠它就能查到「已经被淘汰了」
+    if (status === undefined && entry.contentId) status = byContentId.get(entry.contentId)
+    // 摘要条目的文本是压缩过的，内容哈希必然对不上原文，改用它的来源位置查。
+    // 早期版本把 source_id 写成「对话记录.md#L123」，和生产格式对不上，
+    // 这里两种都认，免得旧档案里的摘要集体失忆。
+    if (status === undefined && entry.sourceId) {
+      status = bySourceId.get(entry.sourceId)
+      if (status === undefined) {
+        const legacy = /#L(\d+)$/.exec(entry.sourceId)
+        if (legacy) status = bySourceId.get('dialogue:' + legacy[1])
+      }
+    }
     if (status === undefined && bySourceId.has(entry.id)) {
       idDrift += 1
       status = undefined
