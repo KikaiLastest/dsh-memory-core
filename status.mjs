@@ -80,7 +80,10 @@ export function resolveEntryStatus(entry, statusMap) {
  * @returns {boolean} 是否允许召回/注入
  */
 export function isRecallable(status, options = {}) {
-  const { degraded = false, conservative = false } = options
+  // 默认保守：状态表损坏时，无法证明有效的记忆一律不召回。
+  // 反过来（默认放行）会让被 superseded 的旧决策在状态表一坏时整体复活，
+  // 而模型会照着它执行——这比「记不住」危险得多。
+  const { degraded = false, conservative = true } = options
 
   // 显式废弃/归档/草稿，任何时候坚决不可召回
   if (status && status !== 'active') {
@@ -110,7 +113,7 @@ export function isRecallable(status, options = {}) {
  * @param {Array<Object>} entries 候选条目列表
  * @param {Object} statusMap loadStatusMap 返回的状态元数据
  * @param {Object} [options]
- * @param {boolean} [options.conservative=false] 降级时是否保守过滤
+ * @param {boolean} [options.conservative=true] 降级时是否保守过滤
  * @returns {{ recallable: Array<Object>, suppressed: number, unverified: number, idDrift: number }}
  */
 export function filterRecallableEntries(entries, statusMap, options = {}) {
@@ -120,7 +123,8 @@ export function filterRecallableEntries(entries, statusMap, options = {}) {
   let idDrift = 0
 
   const degraded = Boolean(statusMap && statusMap.degraded)
-  const conservative = Boolean(options.conservative)
+  // 和 isRecallable 同一个安全默认：降级时宁可少召回，不可放出过期决策
+  const conservative = options.conservative === undefined ? true : Boolean(options.conservative)
 
   for (const entry of entries) {
     const status = resolveEntryStatus(entry, statusMap)

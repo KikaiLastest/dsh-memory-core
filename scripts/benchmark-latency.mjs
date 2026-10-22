@@ -89,8 +89,10 @@ for (const source of EXPECTED_SOURCES) {
           fileEntries += 1
           if (source.isSearchable) {
             searchableEntryCount += 1
-            totalSearchableBytes += bytes
+            // 按行累加。以前这里加的是整个文件的 bytes，JSONL 有多少行就会被算多少倍，
+            // 基准报告里的语料体量直接虚高成 O(行数²)。
             const len = Buffer.byteLength(trimmed, 'utf8')
+            totalSearchableBytes += len
             if (len > maxEntryBytes) maxEntryBytes = len
           } else {
             statusRecordCount += 1

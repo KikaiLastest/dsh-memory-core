@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { recall } from '../index.js'
 import { consolidate } from '../consolidate.mjs'
-import { loadStatusMap } from '../status.mjs'
+import { loadStatusMap, isRecallable } from '../status.mjs'
 
 // 打真实 recall 与真实 consolidate，不复制任何实现。
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'status-'))
@@ -369,6 +369,33 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
   const resRev = loadStatusMap({ structuredFile: fileRev })
   assert.deepEqual(Object.fromEntries(resFwd.byContentId), Object.fromEntries(resRev.byContentId), '内容身份映射必须顺序无关')
   assert.deepEqual(Object.fromEntries(resFwd.bySourceId), Object.fromEntries(resRev.bySourceId), '来源坐标映射必须顺序无关')
+}
+
+// ── 12. 降级默认必须保守 ────────────────────────────────────────
+// 状态表损坏时，「不知道这条有没有被淘汰」不能当成「它还有效」。
+// 这个默认值曾经写成 false，而 JSDoc 写的是 true —— 安全防护被自己的默认值架空。
+{
+  // 正常情况：向后兼容，没标过状态的旧记录照常召回
+  assert.equal(isRecallable(undefined), true)
+  assert.equal(isRecallable(null), true)
+  assert.equal(isRecallable('active'), true)
+  assert.equal(isRecallable('superseded'), false)
+  assert.equal(isRecallable('archived'), false)
+  assert.equal(isRecallable('draft'), false)
+
+  // 降级：调用方什么都不传，也必须保守
+  assert.equal(isRecallable(undefined, { degraded: true }), false, '降级默认必须保守')
+  assert.equal(isRecallable(undefined, { degraded: true, conservative: true }), false)
+
+  // 显式选择宽松才放行
+  assert.equal(isRecallable(undefined, { degraded: true, conservative: false }), true)
+
+  // 显式状态永远优先于降级开关
+  assert.equal(
+    isRecallable('superseded', { degraded: true, conservative: false }),
+    false,
+    '显式废弃的记录，任何降级策略下都不该放行',
+  )
 }
 
 fs.rmSync(dir, { recursive: true, force: true })
