@@ -463,15 +463,20 @@ export function recall(cfg, query, deadline = Infinity) {
 
   const hits = scan(null, 0)
   const top = hits[0]
-  if (!top) return []
-  const floor = Math.max(cfg.minScore || 0.02, top.score * (cfg.minRatio || 0.3))
-  // 用 ?? 而不是 ||：minCoverage 允许调到 0（只要命中就算），|| 会把 0 悄悄换成默认值
-  const minCoverage = cfg.minCoverage ?? 0.2
-  const minMatched = cfg.minMatched ?? 2
-  const strict = hits.filter(
-    (h) => h.score >= floor && h.coverage >= minCoverage && h.matched >= minMatched,
-  )
-  if (strict.length > 0) return strict.slice(0, cfg.topK)
+  // top 为空时**不能**直接 return。
+  // 之前这里写的是 if (!top) return []，于是「原始 2-gram 一个都没命中」
+  // 这种情况根本走不到下面的扩展回退——而那恰恰是最需要回退的时候。
+  // 冻结集里大面积的空召回，根子就在这一行。
+  if (top) {
+    const floor = Math.max(cfg.minScore || 0.02, top.score * (cfg.minRatio || 0.3))
+    // 用 ?? 而不是 ||：minCoverage 允许调到 0（只要命中就算），|| 会把 0 悄悄换成默认值
+    const minCoverage = cfg.minCoverage ?? 0.2
+    const minMatched = cfg.minMatched ?? 2
+    const strict = hits.filter(
+      (h) => h.score >= floor && h.coverage >= minCoverage && h.matched >= minMatched,
+    )
+    if (strict.length > 0) return strict.slice(0, cfg.topK)
+  }
 
   // 受控回退：严格门槛下一条都不剩，而查询本身不是两个字的口头语。
   // 拿同义词表把查询扩一次再扫，扩展词只加分、不摊薄覆盖率，
@@ -490,11 +495,18 @@ export function recall(cfg, query, deadline = Infinity) {
   //                        扩展命中再多也不能凭空造出相关性；
   //   queryMatched + expansionMatched ≥ 2 —— 合起来够两个片段才放行；
   //   coverage ≥ 0.1 是原始覆盖率，不含扩展贡献。
+  // 之前这里要求 queryMatched >= 1，等于「原始查询至少真命中一个片段」。
+  // 那条规则的初衷是对的（扩展不能凭空造相关性），但它把「原始 2-gram 全灭、
+  // 靠扩展才有一线希望」这种情况一刀切掉了——而那正是空召回的大头。
+  // 现在改成：总计至少两个片段，且**至少一个来自扩展**。
+  // 完全靠原始命中凑数的候选不会走这条路（它上面就被 strict 接走了）。
   return retry
     .filter(
       (h) =>
-        h.queryMatched >= 1 &&
         h.queryMatched + h.expansionMatched >= 2 &&
+        h.expansionMatched >= 1 &&
+        // 试过放宽到 0.05：Recall 一动不动，无答案误召从 8.3% 涨到 12.5%。
+        // 说明覆盖率不是瓶颈，词表覆盖面才是，所以退回来。
         h.coverage >= 0.1 &&
         h.rawScore >= rtop.rawScore * 0.5,
     )
