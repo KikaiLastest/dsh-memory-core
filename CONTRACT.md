@@ -50,7 +50,41 @@
 - `scripts/quality-frozen.mjs`（157 条）是**冻结集**，只用来观察基线，**不许为了让它变绿去改语料或调参**。
 - 当前冻结基线：Recall@1 48.1% / Recall@3 49.6% / MRR 0.489 / 无答案误召 8.3%。
 
-## 5. 硬性规则
+## 5. 证据判定与注入
+
+`recallWithVerdict(cfg, query, deadline)` 返回：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| hits | RecallHit[] | 与 `recall()` 返回值完全一致的候选 |
+| verdict | 'answer' \| 'ambiguous' \| 'abstain' | 证据够不够拿出来用 |
+| evidenceStrength | number | **启发式**证据强度，0–1 |
+| confidence | number | 同值别名，只为兼容保留，新代码用 evidenceStrength |
+| reason | string | 判定理由，来自 `REASON` 枚举 |
+
+`evidenceStrength` **不是校准概率**。0.82 不表示「82% 概率正确」，
+它只是覆盖率、命中数、密度的加权组合。文档和代码里都不许把它叫成 confidence 或置信度。
+
+### 注入行为（本契约的目标状态）
+
+`agent/pre-step` 的注入路径必须读 verdict，不能只看 `hits.length > 0`：
+
+| verdict | 注入行为 |
+|---|---|
+| answer | 正常注入记忆块 |
+| ambiguous | 按明确设计降级呈现（标注歧义，不伪装成确定答案） |
+| abstain | **不注入**任何候选 |
+
+判定逻辑只允许来自 `abstain.mjs`。注入路径不许再手写一套自己的规则。
+
+判定与注入必须一起记进日志：verdict、reason、耗时、是否注入。
+
+### 当前状态（未达成，别当成已有）
+
+`index.js` 第 945 行的注入路径仍直接调 `recall()`，只判断 `hits.length`。
+上面的注入表是**待实现的目标**，不是现状。集成完成前不要在文档里写成已完成。
+
+## 6. 硬性规则
 
 1. 不许为了指标好看改冻结语料或删失败样例。
 2. 不许把 `recall` 的返回结构改得不兼容。

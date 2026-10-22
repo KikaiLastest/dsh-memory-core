@@ -539,11 +539,16 @@ export function recallWithVerdict(cfg, query, deadline = Infinity) {
   }
 }
 
-function buildBlock(hits) {
+function buildBlock(hits, verdict) {
   const lines = [
     '以下为自动召回的历史记忆，不是用户本轮发言，仅作参考。',
-    '',
   ]
+  // ambiguous 必须显式降级。之前这段没有 verdict 概念，
+  // 候选再多也照样当成确定答案平铺出去，等于把歧义伪装成事实。
+  if (verdict === 'ambiguous') {
+    lines.push('注意：命中内容互相矛盾或不足以确定答案，以下信息存在不确定性，不要当成定论。')
+  }
+  lines.push('')
   for (const h of hits) {
     const lineTag = h.entry.line ? ' 行 ' + h.entry.line : ''
     const timeTag = h.entry.createdAt || h.entry.created_at ? ' | 时间：' + (h.entry.createdAt || h.entry.created_at) : ''
@@ -942,10 +947,20 @@ export function apply(ctx, config = {}) {
             return decision
           }
           const started = Date.now()
-          const hits = recall(cfg, query, started + cfg.timeoutMs)
+          // 注入路径必须走 verdict，不能只看 hits 非空。
+          // 「找到候选」和「该拿出来用」是两件事，判定逻辑只有 abstain.mjs 一处。
+          const judged = recallWithVerdict(cfg, query, started + cfg.timeoutMs)
+          const hits = judged.hits
+          const verdict = judged.verdict
+          const verdictReason = judged.reason
           const ms = Date.now() - started
           if (!Array.isArray(hits) || hits.length === 0) {
-            appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: [], ms, injected: false })
+            appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: [], ms, injected: false, verdict, reason: verdictReason })
+            return decision
+          }
+          // abstain：候选确实存在，但证据不够。注入候选等于让模型拿噪声当记忆。
+          if (verdict === 'abstain') {
+            appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: [], ms, injected: false, verdict, reason: verdictReason })
             return decision
           }
 
@@ -958,8 +973,8 @@ export function apply(ctx, config = {}) {
           seen.add(key)
           if (seen.size > SEEN_LIMIT) seen.delete(seen.values().next().value)
 
-          const text = buildBlock(hits)
-          appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: scored, ms, injected: true })
+          const text = buildBlock(hits, verdict)
+          appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: scored, ms, injected: true, verdict, reason: verdictReason })
           return { ...decision, messages: [makeRecallMessage(text), ...decision.messages] }
         } catch {
           return decision
