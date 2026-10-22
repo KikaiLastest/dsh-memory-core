@@ -17,8 +17,11 @@
 |---|---|
 | **P0a 记忆使用协议** | 用 `systemPrompt.section` 注入 5 条规则：历史参考不是本轮发言、可能过期、要能追溯、以新事实为准、不许编造。刻意**不重复** AGENTS.md 的人格段，避免权威倒置。 |
 | **P0b 按需召回** | `agent/pre-step` 且 `step === 1` 时，用中文 2-gram + BM25-lite + 覆盖率阈值，从档案召回 top 3，**前置**注入一条带 `source.kind='memory-recall'` 的消息。150 ms 硬超时，失败静默。 |
+| **P0c 常驻记忆导航** | 另一个 `systemPrompt.section`（order 960），把「档案有哪些主题、最近几条记忆的一行摘要 + 关键词」压到 600 字以内注入。没有记忆时不注入；模型需要细节时按关键词自己回查，不靠召回碰运气。 |
+| **P0d 后台总结** | `setInterval`（默认 10 分钟，`unref()`）检查对话文件：空闲超过 30 分钟且有新增小节时，按「标题 + 首句」追加到 `~/.dsh/autocapture/summaries.jsonl`。纯规则、不调 LLM，内容 hash + 小节 key 双重水位保证幂等。 |
 | **P1 结构化固化** | `consolidate.mjs` 把对话小节转成 `structured.jsonl`：稳定 ID、`source_id`、逐字校验的 `quote`、幂等水位。 |
 | **P2 情感状态** | `valence` / `arousal` 两标量 + 规则分类 + 指数衰减 + 事件去重，只影响语气，不碰调度与安全规则。 |
+| **P3 写入脱敏** | `sanitize.mjs` 在自动捕获与摘要落盘前过滤 `sk-` / `gh*_` / `github_pat_` / `AKIA` / `Bearer` / `password=` / `token=` / `api_key=` 等常见凭证，命中替换成 `[REDACTED]`。纯本地正则，可在面板关掉。 |
 
 ## 本地记忆（全部落盘，无云端）
 
@@ -37,6 +40,16 @@ memory/
 ```
 
 - **召回**只读上面这些文件，命中后带来源（文件 + 行号）注入。
+- **导航**只读 memoryRoot 下的 md、对话记录与自动捕获 JSONL，不写任何东西。
+- **后台总结**把摘要写到独立目录，绝不碰 `memory/`：
+
+```
+~/.dsh/autocapture/
+├── captures.jsonl              # 自动捕获（已有）
+├── summaries.jsonl             # 后台摘要：id / title / summary / keywords / source_id
+└── summaries.jsonl.watermark.json   # 内容 hash + 已处理小节 key，保证幂等
+```
+
 - **固化**把对话小节写成 `structured.jsonl`，每条都带 `source_id` 和一段**逐字校验**过的 `quote`——在原文里搜不到就丢弃。
 - **情感状态**是一个 `state.json`，两个标量 + 触发原因。
 - 换机器时把整个目录拷走即可，没有需要迁移的数据库。
@@ -67,9 +80,16 @@ dsh plugin --profile <你的 profile> add file:<这个目录>
         minCoverage: 0.2
         minRatio: 0.3
         enableStable: true
+        enableAutoCapture: true
+        enableMemoryNav: true
+        summaryMaxChars: 600
+        enableSummary: true
+        summarizeIntervalMinutes: 10
+        summarizeIdleMinutes: 30
+        enableSanitize: true
 ```
 
-## 设置面板（0.2.0）
+## 设置面板（0.3.0）
 
 DSH 设置页左侧多一节 **「记忆核心」**（客户端 slot `settings.section`，`id: memory-core`，`order: 58`）。面板只做两件事：读当前生效值、把改动存回配置。
 
@@ -85,28 +105,58 @@ DSH 设置页左侧多一节 **「记忆核心」**（客户端 slot `settings.s
 | `dailyQuota` | 数字 | 10 | 0–100 | 自动捕获每日配额（0 = 不写） |
 | `enableStable` | 开关 | 开 | — | 是否注入常驻「记忆使用协议」 |
 | `enableAutoCapture` | 开关 | 开 | — | 是否开启自动捕获 |
+| `enableMemoryNav` | 开关 | 开 | — | 是否注入常驻「记忆导航」（无记忆时不注入） |
+| `summaryMaxChars` | 数字 | 600 | 80–2000 | 导航总长度上限（字），超出按新鲜度截断 |
+| `enableSummary` | 开关 | 开 | — | 是否跑后台摘要 |
+| `summarizeIntervalMinutes` | 数字 | 10 | 1–1440 | 后台检查间隔（分钟） |
+| `summarizeIdleMinutes` | 数字 | 30 | 1–1440 | 对话文件空闲多久才总结（分钟） |
+| `enableSanitize` | 开关 | 开 | — | 自动捕获 / 摘要写入前是否脱敏 |
 
 保存链路：客户端 `POST /dsh-memory-core/config/save` → `config.mjs` 严格校验（越界 / 类型错直接点名，不偷偷改值）→ **`ctx.configEditor.edit()`** 写进 profile 的 patch 层（宿主自己的配置机制：保留 YAML 注释与 `!!js`，重启后仍在）→ 同时就地更新运行中的配置，下一轮召回立刻按新值走。
 
 - 参数表只写在 `config.mjs` 一张表里，客户端从 `GET /dsh-memory-core/config` 拿表渲染，不重复写死中文标签。
 - 部署里没有 `configEditor`（如 headless）时：改动当次生效，面板会明说「存不进配置文件」。
-- 日志路径 / 捕获存档路径 / affect 状态文件仍然只在 `cordis.patch.yml` 里改。
+- 日志路径 / 捕获存档路径 / 摘要存档路径 / affect 状态文件仍然只在 `cordis.patch.yml` 里改。
+
+## 记忆导航、后台总结与脱敏
+
+**记忆导航**（`summary.mjs` 的 `buildNav`）是常驻的，但只给“索引”不给全文：
+
+- 扫 `memoryRoot` 下的 `.md`、`dialogueFile`、`autocaptureStore`，按文件 mtime / 标题日期 / `created_at` 排新鲜度；
+- 头部列最近 8 个主题，下面列最近几条的「日期 + 来源 + 首句 + 关键词」；
+- 总长度 `summaryMaxChars`（默认 600）硬限制，放不下的旧条目先丢；一条记忆都没有时返回空串，`systemPrompt.section` 不会注入空块；
+- 按文件 mtime + 长度缓存，对话量再大也不会每轮重扫。
+
+**后台总结**（`summary.mjs` 的 `summarizeDialogue`）默认每 10 分钟检查一次：
+
+1. 对话文件 mtime 距今不足 `summarizeIdleMinutes`（默认 30 分钟）→ 认为还在聊，跳过；
+2. 内容 hash 与水位一致 → 跳过（幂等）；
+3. 按 `## / ### / ####` 切小节，取「标题 + 首句（截断 120 字）」，追加到 `~/.dsh/autocapture/summaries.jsonl`；
+4. 水位文件记录内容 hash + 已处理小节 key（最多 5000 条），文件追加后再跑只处理新增部分；落盘 id 也会二次去重。
+
+定时器用的是 `unref()` 的 `setInterval`，不会阻止 DSH 退出；面板改开关或间隔会当场重排定时器。
+
+**写入脱敏**（`sanitize.mjs`）在两条写路径生效：`autocapture.mjs` 的 `autoCapture`（`redact` 参数）和 `summarizeDialogue` 的摘要记录。覆盖 `sk-`、`gho_/ghp_/github_pat_`、`AKIA`、`Bearer`、`password=/token=/api_key=`；已替换的位置用负向前瞻跳过，所以重复调用不会二次计数。默认开启，`enableSanitize: false` 可关。
 
 ## 测试
 
 ```bash
-npm test                 # selftest + affect 单测 + 召回评测 + 参数校验 + 面板路由
+npm test                 # selftest + affect + 脱敏 + 导航/摘要 + 召回评测 + 参数校验 + 面板路由
 npm run consolidate      # 跑一次固化（幂等）
 ```
 
 `selftest` 用 mock 宿主验证：section 注册、注入前缀、不相关查询不注入、情感状态变化、日志写入。
+`test/sanitize.test.mjs` 覆盖 9 类密钥模式、幂等、大小写与普通文本不误伤。
+`test/summary.test.mjs` 覆盖空档案不注入、导航内容/长度上限/截断、摘要抽取、水位幂等、追加只摘新增、空闲判定、写入脱敏与开关。
 `test/panel-routes.test.mjs` 用假 ctx / webServer / configEditor 跑一遍读写路由：校验拒绝、落盘调用、0 值保留、headless 降级。
 
 ## 已知限制
 
 - **召回是词面匹配**，不是语义检索；改写幅度大的查询会漏。
+- **导航与摘要都是规则抽取**：主题取标题、摘要取首句，不保证语义完整；后台总结只处理对话文件，且必须在空闲窗口里才跑。
 - **固化目前是规则抽取**（`fact` 取小节标题），LLM 事实提取与冲突处理还没做。
 - **档案超过 200 KB 时**要考虑上真正的索引（当前靠 mtime 缓存撑）。
+- **脱敏是模式匹配**，只覆盖常见凭证形态，不认识的密钥格式仍可能漏过。
 - 召回内容一律按不可信数据处理；但模型仍可能被其中的话术影响，这是概率问题，不是开关问题。
 
 ## 设计文档

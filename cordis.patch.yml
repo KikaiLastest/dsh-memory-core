@@ -13,3 +13,9 @@
         minMatched: 2
         enableStable: true
         enableAutoCapture: true
+        enableMemoryNav: true
+        summaryMaxChars: 600
+        enableSummary: true
+        summarizeIntervalMinutes: 10
+        summarizeIdleMinutes: 30
+        enableSanitize: true

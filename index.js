@@ -5,6 +5,7 @@ import crypto from 'node:crypto'
 import { classify, applyEvent, decay, loadState, saveState, toneHint } from './affect.mjs'
 import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
 import { autoCapture, readCaptureStore } from './autocapture.mjs'
+import { buildNav, summarizeDialogue } from './summary.mjs'
 import {
   fieldDescriptors,
   groupDescriptors,
@@ -27,6 +28,11 @@ const DEFAULT_AUTOCAPTURE_STORE = path.join(
   process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
   'autocapture',
   'captures.jsonl'
+)
+const DEFAULT_SUMMARY_STORE = path.join(
+  process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
+  'autocapture',
+  'summaries.jsonl'
 )
 
 const STOP = new Set([
@@ -338,15 +344,42 @@ function textOf(message) {
 }
 
 export function apply(ctx, config = {}) {
-  // 面板上的那 10 个参数统一走 config.mjs：默认值 + 范围夹取（0 是合法值，不会被 || 吃掉）。
-  // 其余内部路径（日志、捕获存档、affect 状态）仍然只在 cordis.patch.yml 里改。
+  // 面板上的那 16 个参数统一走 config.mjs：默认值 + 范围夹取（0 是合法值，不会被 || 吃掉）。
+  // 其余内部路径（日志、捕获/摘要存档、affect 状态）仍然只在 cordis.patch.yml 里改。
   const cfg = {
     ...normalizeConfig(config),
     logFile: config.logFile || DEFAULT_LOG,
     autocaptureStore: config.autocaptureStore || DEFAULT_AUTOCAPTURE_STORE,
+    summaryStore: config.summaryStore || DEFAULT_SUMMARY_STORE,
+    summaryWatermark: config.summaryWatermark || '',
     minRatio: typeof config.minRatio === 'number' && config.minRatio > 0 ? config.minRatio : 0.3,
     minScore: typeof config.minScore === 'number' && config.minScore > 0 ? config.minScore : 0.02,
     stateFile: config.stateFile || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'affect', 'state.json'),
+  }
+
+  // ── 后台总结 ────────────────────────────────────────────────────────────
+  // 只挂一个 setInterval，默认 10 分钟看一次；对话文件空闲够久才真的抽摘要。
+  // 定时器 unref()，不会把进程钉住；面板改了间隔/开关会 syncSummarizer() 立刻重排。
+  let summarizeTimer = null
+
+  const stopSummarizer = () => {
+    if (summarizeTimer === null) return
+    clearInterval(summarizeTimer)
+    summarizeTimer = null
+  }
+
+  const syncSummarizer = () => {
+    stopSummarizer()
+    if (!cfg.enableSummary) return
+    const minutes = Math.max(1, Math.min(1440, Math.floor(Number(cfg.summarizeIntervalMinutes) || 10)))
+    summarizeTimer = setInterval(() => {
+      try {
+        summarizeDialogue(cfg)
+      } catch {
+        /* 后台任务不打断前台 */
+      }
+    }, minutes * 60 * 1000)
+    if (typeof summarizeTimer.unref === 'function') summarizeTimer.unref()
   }
 
   // 常驻段可以随时开关：面板上切了「注入常驻规则段」不必等插件重载。
@@ -482,6 +515,7 @@ export function apply(ctx, config = {}) {
 
         Object.assign(cfg, checked.values)
         syncStable()
+        syncSummarizer()
 
         const editor = editorOf()
         if (editor === undefined) {
@@ -551,6 +585,25 @@ export function apply(ctx, config = {}) {
       } catch {
         /* best-effort */
       }
+      // 常驻记忆导航：告诉模型档案里有哪些主题、最近几条是什么，需要时自己去查。
+      // text() 每轮现取，buildNav 内部按文件 mtime 缓存；没记忆 / 开关关掉都返回空串。
+      try {
+        c.systemPrompt.section({
+          name: 'dsh-memory-core:nav',
+          order: 960,
+          interpolate: false,
+          text: () => {
+            if (!cfg.enableMemoryNav) return ''
+            try {
+              return buildNav(cfg, { maxChars: cfg.summaryMaxChars })
+            } catch {
+              return ''
+            }
+          },
+        })
+      } catch {
+        /* best-effort */
+      }
       mountStable()
     })
   } catch {
@@ -600,6 +653,7 @@ export function apply(ctx, config = {}) {
                 initialWeight: 1.0,
                 permanent: false,
                 source: 'dialogue',
+                redact: cfg.enableSanitize !== false,
               })
             } catch {
               /* best-effort */
@@ -639,6 +693,16 @@ export function apply(ctx, config = {}) {
       },
       { prepend: true },
     )
+  } catch {
+    /* best-effort */
+  }
+
+  // 后台总结：先按当前配置启动；插件销毁时把定时器一起停掉。
+  try {
+    syncSummarizer()
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => () => stopSummarizer())
+    }
   } catch {
     /* best-effort */
   }

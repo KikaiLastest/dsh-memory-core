@@ -135,12 +135,16 @@ assert.equal(after.body.config.halfLifeDays, 90)
 // 常驻段开关：不重载插件也要当场挂上 / 摘下
 assert.deepEqual(
   [...one.sections].sort(),
-  ['dsh-memory-core:affect', 'dsh-memory-core:stable'],
-  '默认挂了常驻段 + affect',
+  ['dsh-memory-core:affect', 'dsh-memory-core:nav', 'dsh-memory-core:stable'],
+  '默认挂了常驻段 + 导航 + affect',
 )
 const offSave = await call(one.routes.get('/dsh-memory-core/config/save'), { enableStable: false })
 assert.equal(offSave.body.ok, true)
-assert.deepEqual(one.sections, ['dsh-memory-core:affect'], '关掉常驻段：当场摘下来了')
+assert.deepEqual(
+  [...one.sections].sort(),
+  ['dsh-memory-core:affect', 'dsh-memory-core:nav'],
+  '关掉常驻段：只摘 stable，导航还在',
+)
 const onSave = await call(one.routes.get('/dsh-memory-core/config/save'), { enableStable: true })
 assert.equal(onSave.body.ok, true)
 assert.ok(one.sections.includes('dsh-memory-core:stable'), '再打开：又挂回去了')

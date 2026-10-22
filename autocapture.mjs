@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { sanitize } from './sanitize.mjs'
 
 /**
  * 筛选重要/值得保留的对话启发式规则。
@@ -109,6 +110,7 @@ export function checkDailyQuota(storePath, dailyQuota = 10, todayStr = new Date(
  * @param {number} [options.initialWeight=1.0] 初始权重 (0-1)
  * @param {boolean} [options.permanent=false] 是否永久不衰减
  * @param {string} [options.source='dialogue'] 来源
+ * @param {boolean} [options.redact=true] 写入前是否把常见密钥/token 脱敏成 [REDACTED]
  * @param {number} [options.now=Date.now()] 当前时间戳
  * @returns {{ captured: boolean, reason?: string, record?: Object }}
  */
@@ -120,6 +122,7 @@ export function autoCapture(options) {
     initialWeight = 1.0,
     permanent = false,
     source = 'dialogue',
+    redact = true,
     now = Date.now(),
   } = options || {}
 
@@ -144,18 +147,21 @@ export function autoCapture(options) {
     return { captured: false, reason: 'daily_quota_exceeded', countToday: quota.countToday }
   }
 
-  const id = 'cap-' + crypto.createHash('sha1').update(text.trim()).digest('hex').slice(0, 12)
+  const rawText = text.trim()
+  // 脱敏只影响落盘内容；是否值得捕获仍按原文的规则判断（避免密钥替换后误伤规则）。
+  const storedText = redact === false ? rawText : sanitize(rawText)
+  const id = 'cap-' + crypto.createHash('sha1').update(storedText).digest('hex').slice(0, 12)
   const createdAt = new Date(now).toISOString()
 
   const existing = readCaptureStore(storePath)
-  if (existing.some((r) => r.id === id || r.text === text.trim())) {
+  if (existing.some((r) => r.id === id || r.text === storedText)) {
     return { captured: false, reason: 'duplicate_entry', id }
   }
 
   const record = {
     id,
     type: 'auto_capture',
-    text: text.trim(),
+    text: storedText,
     weight: Math.max(0, Math.min(1, Number(initialWeight) || 1.0)),
     permanent: Boolean(permanent),
     created_at: createdAt,

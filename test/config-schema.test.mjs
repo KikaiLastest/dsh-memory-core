@@ -9,8 +9,8 @@ import {
   validatePatch,
 } from '../config.mjs'
 
-// 1. 表本身：10 个参数、key 不重复、字符串/数字/布尔都有范围或默认值
-assert.equal(FIELD_DEFS.length, 10, '10 个可调参数')
+// 1. 表本身：16 个参数、key 不重复、字符串/数字/布尔都有范围或默认值
+assert.equal(FIELD_DEFS.length, 16, '16 个可调参数')
 const keys = FIELD_DEFS.map((f) => f.key)
 assert.equal(new Set(keys).size, keys.length, 'key 不重复')
 for (const f of FIELD_DEFS) {
@@ -26,6 +26,19 @@ for (const f of FIELD_DEFS) {
 }
 console.log('schema ->', FIELD_DEFS.length, 'fields,', GROUPS.length, 'groups')
 
+// 1b. 新增的导航 / 总结 / 脱敏参数：默认值与类型都对
+const byKey = Object.fromEntries(FIELD_DEFS.map((f) => [f.key, f]))
+assert.equal(byKey.enableMemoryNav.type, 'boolean')
+assert.equal(byKey.enableMemoryNav.default, true)
+assert.equal(byKey.enableSummary.type, 'boolean')
+assert.equal(byKey.enableSanitize.type, 'boolean')
+assert.equal(byKey.summaryMaxChars.type, 'number')
+assert.equal(byKey.summaryMaxChars.default, 600)
+assert.equal(byKey.summarizeIntervalMinutes.default, 10)
+assert.equal(byKey.summarizeIdleMinutes.default, 30)
+assert.equal(byKey.summaryMaxChars.group, 'summary', '新参数归到 summary 分组')
+assert.ok(GROUPS.some((g) => g.id === 'summary'), 'summary 分组存在')
+
 // 2. normalizeConfig：坏值退回默认值，越界夹回范围，0 不被当成空
 const dflt = normalizeConfig({})
 assert.deepEqual(dflt, DEFAULTS, '空配置 = 默认值')
@@ -39,6 +52,11 @@ assert.equal(zeroes.dailyQuota, 0, 'dailyQuota=0 保留')
 assert.equal(normalizeConfig({ topK: 'abc' }).topK, DEFAULTS.topK, '非数字退回默认')
 assert.equal(normalizeConfig({ memoryRoot: '   ' }).memoryRoot, DEFAULTS.memoryRoot, '空路径退回默认')
 assert.equal(normalizeConfig({ enableStable: false }).enableStable, false, '显式 false 保留')
+const summaryClamp = normalizeConfig({ summaryMaxChars: 5, summarizeIntervalMinutes: 99999 })
+assert.equal(summaryClamp.summaryMaxChars, 80, 'summaryMaxChars 夹到下限')
+assert.equal(summaryClamp.summarizeIntervalMinutes, 1440, '总结间隔夹到上限')
+assert.equal(normalizeConfig({ enableMemoryNav: false }).enableMemoryNav, false, '导航开关 false 保留')
+assert.equal(normalizeConfig({}).summaryMaxChars, 600, '导航长度默认 600')
 console.log('normalize -> clamp/zero/default ok')
 
 // 3. validatePatch：合法改动通过、越界与类型错误被点名
@@ -62,6 +80,16 @@ assert.equal(badText.ok, false, '空路径要拒绝')
 
 const badNumber = validatePatch({ timeoutMs: '很快' })
 assert.equal(badNumber.ok, false, '非数字要拒绝')
+
+const badSummary = validatePatch({ summaryMaxChars: 5000 })
+assert.equal(badSummary.ok, false, '导航长度越界要拒绝')
+assert.match(badSummary.errors.summaryMaxChars, /80–2000/, '报出导航长度范围')
+
+const goodSummary = validatePatch({ enableSanitize: false, summarizeIdleMinutes: 45, enableMemoryNav: false })
+assert.equal(goodSummary.ok, true, '新增开关与间隔能保存')
+assert.equal(goodSummary.values.enableSanitize, false)
+assert.equal(goodSummary.values.summarizeIdleMinutes, 45)
+assert.equal(goodSummary.values.enableMemoryNav, false)
 
 const empty = validatePatch({})
 assert.equal(empty.ok, false, '空改动要拒绝')
