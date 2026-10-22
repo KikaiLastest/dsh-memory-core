@@ -233,6 +233,7 @@ export function loadStatusMap(cfg = {}) {
   const records = []
   let syntaxErrors = 0
   let schemaErrors = 0
+  let conflictErrors = 0
   let totalLines = 0
   let danglingRefs = 0
 
@@ -253,8 +254,9 @@ export function loadStatusMap(cfg = {}) {
     //    - 若缺失或为 null，按向后兼容迁移策略赋以明确的 'active' 确定状态；
     //    - 若为合法枚举字符串，保留其值；
     //    - 若为非法枚举值或非字符串类型，坚决计入 schemaErrors 并触发降级保护。
-    // 3. 拦截重复 ID 冲突（相同内容 ID 重复声明）
+    // 3. supersedes 字段如果显式存在，必须是非空合法字符串或显式 null，拦截 ""、0、false、数组等假值
     // 4. 拦截自身替代 (supersedes === id)
+    // 5. 拦截重复 ID 冲突
     if (!rec || typeof rec !== 'object' || typeof rec.id !== 'string' || !rec.id.trim() || typeof rec.source_id !== 'string' || !rec.source_id.trim()) {
       schemaErrors += 1
       continue
@@ -271,30 +273,56 @@ export function loadStatusMap(cfg = {}) {
       }
     }
 
+    if (Object.hasOwn(rec, 'supersedes')) {
+      const s = rec.supersedes
+      if (s !== null && s !== undefined) {
+        if (typeof s !== 'string' || !s.trim()) {
+          schemaErrors += 1 // 拦截 supersedes: ""、0、false、[] 等非法假值
+          continue
+        }
+        if (s === rec.id) {
+          schemaErrors += 1 // 自身替代悖论
+          continue
+        }
+      }
+    }
+
     if (byMemId.has(rec.id)) {
       schemaErrors += 1 // 重复 ID 冲突
       continue
     }
 
-    if (rec.supersedes && rec.supersedes === rec.id) {
-      schemaErrors += 1 // 自我替代逻辑悖论
-      continue
-    }
-
     records.push({ rec, status })
     byMemId.set(rec.id, rec)
-    bySourceId.set(rec.source_id, status)
     byContentId.set(rec.id, status)
   }
 
-  // ── 有向图引用完整性、覆盖传递与环路检测（Cycle Detection）──────────────
+  // ── 来源坐标 source_id 一对多顺序无关确定性归并 ──────────────────────
+  // 物理行号会随文件编辑插入而自然漂移。同一 source_id 在不同历史小节中出现时：
+  // 采用状态集合归并，彻底消除 Map.set() 依赖文件行遍历顺序的不确定性。
+  const sourceStatuses = new Map()
+  for (const { rec, status } of records) {
+    let set = sourceStatuses.get(rec.source_id)
+    if (!set) {
+      set = new Set()
+      sourceStatuses.set(rec.source_id, set)
+    }
+    set.add(status)
+  }
+  for (const [srcId, set] of sourceStatuses) {
+    if (set.size === 1) {
+      bySourceId.set(srcId, set.values().next().value)
+    } else {
+      // 出现状态歧义（同一坐标既有 active 又有 superseded），保守归约为 'superseded'
+      // 避免行顺序随机决定状态，强制依赖内容哈希作为权威身份
+      bySourceId.set(srcId, 'superseded')
+    }
+  }
+
+  // ── 有向图引用完整性、覆盖传递与迭代式环路检测（Stack-Safe Cycle Detection）──
   const graph = new Map() // id -> supersedes_id
   for (const { rec } of records) {
-    if (!rec.supersedes) continue
-    if (typeof rec.supersedes !== 'string' || !rec.supersedes.trim()) {
-      schemaErrors += 1
-      continue
-    }
+    if (!rec.supersedes || typeof rec.supersedes !== 'string') continue
     const target = byMemId.get(rec.supersedes)
     if (!target) {
       danglingRefs += 1 // 悬空引用：指向不存在的目标记录
@@ -305,32 +333,37 @@ export function loadStatusMap(cfg = {}) {
     if (target.id) byContentId.set(target.id, 'superseded')
   }
 
-  // 三色标记法检测有向环路：递归栈冲突即判定循环替代悖论（如 A -> B -> A）
+  // 显式栈迭代 DFS 检测有向环，彻底消除长链递归爆栈（Stack Overflow）风险
   const visitState = new Map() // 0: 未访, 1: 栈中, 2: 完成
   let cycleErrors = 0
-  const hasCycle = (node, stack = new Set()) => {
-    if (stack.has(node)) return true
-    if (visitState.get(node) === 2) return false
-    stack.add(node)
-    visitState.set(node, 1)
-    const next = graph.get(node)
-    if (next && graph.has(next)) {
-      if (hasCycle(next, stack)) return true
-    }
-    stack.delete(node)
-    visitState.set(node, 2)
-    return false
-  }
-
-  for (const id of graph.keys()) {
-    if (!visitState.has(id)) {
-      if (hasCycle(id)) {
-        cycleErrors += 1
+  for (const startId of graph.keys()) {
+    if (visitState.get(startId) === 2) continue
+    const stack = [startId]
+    const pathSet = new Set()
+    while (stack.length > 0) {
+      const curr = stack[stack.length - 1]
+      if (!visitState.has(curr)) {
+        visitState.set(curr, 1)
+        pathSet.add(curr)
+        const next = graph.get(curr)
+        if (next && graph.has(next)) {
+          if (pathSet.has(next)) {
+            cycleErrors += 1
+            break
+          }
+          if (visitState.get(next) !== 2) {
+            stack.push(next)
+            continue
+          }
+        }
       }
+      pathSet.delete(curr)
+      visitState.set(curr, 2)
+      stack.pop()
     }
   }
 
-  const badLines = syntaxErrors + schemaErrors + danglingRefs + cycleErrors
+  const badLines = syntaxErrors + schemaErrors + conflictErrors + danglingRefs + cycleErrors
   const isCorrupt = records.length === 0 && badLines > 0
   const isPartialCorrupt = records.length > 0 && badLines > 0
   const degraded = isCorrupt || isPartialCorrupt
@@ -342,6 +375,8 @@ export function loadStatusMap(cfg = {}) {
     reason = 'cycle_conflict'
   } else if (danglingRefs > 0) {
     reason = 'dangling_reference'
+  } else if (conflictErrors > 0) {
+    reason = 'source_conflict'
   } else if (isPartialCorrupt) {
     reason = 'partial_corrupt'
   }
@@ -356,6 +391,7 @@ export function loadStatusMap(cfg = {}) {
     totalLines,
     syntaxErrors,
     schemaErrors,
+    conflictErrors,
     danglingRefs,
     cycleErrors,
     brokenLines: badLines,
