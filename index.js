@@ -199,6 +199,12 @@ function loadEntries(cfg, deadline = Infinity) {
 const BM25_K1 = 1.2
 const BM25_B = 0.75
 
+// 纯扩展命中（queryMatched = 0）只在「明确同义」这档放行：
+// 0.8 是 syn.mjs 里 synonym 组的权重，related 组是 0.4。
+// syn.mjs 的注释写得很清楚：related 组不能单独满足原始命中门槛——
+// 「环境 → 环境变量」那类误召就是靠这条挡住的。
+const PURE_EXPANSION_MIN_WEIGHT = 0.8
+
 function buildModel(entries) {
   const df = new Map()
   let totalLen = 0
@@ -226,6 +232,7 @@ function scoreEntry(
   halfLifeDays = 30,
   bonusGrams = null,
   bonusWeight = 0.6,
+  allowExpansionOnly = false,
 ) {
   const { idf, avgdl } = model
   const tf = entry.tf || new Map()
@@ -267,7 +274,14 @@ function scoreEntry(
   // 一开始卡到 0.5，测出来会把真实改写查询一起打回去——
   // 原始只重合一个片段时，扩展必然超过原始的一半，那是正常情况不是异常。
   // 1.0 这个数也是实测的：Recall@3 回到 100%，无答案误召仍是 0。
-  const effectiveExpansion = Math.min(expansionScore, queryScore * 1.0)
+  // 原始 2-gram 一个都没命中时 queryScore 为 0，上面的 1.0 上限会把扩展分一起压成 0，
+  // 于是「正确记忆只含扩展词」永远得不了分（候选进了池也白进）。
+  // 回退通道显式放开这一档，但调用方必须用更严的证据门槛兜底（见 recall 的
+  // expansionMatched >= 2 与 PURE_EXPANSION_MIN_WEIGHT）。
+  const effectiveExpansion =
+    allowExpansionOnly && queryScore === 0
+      ? expansionScore
+      : Math.min(expansionScore, queryScore * 1.0)
 
   // 覆盖率恒等于「原始查询被覆盖的比例」，天然落在 0–1
   const coverage = total === 0 ? 0 : queryMatched / total
@@ -411,8 +425,9 @@ function loadCached(cfg, deadline = Infinity) {
  * 召回。deadline 是绝对时间戳（毫秒），覆盖从冷启动到扫描排名的完整计算路径。
  * 到点主动放弃剩余计算、返回已算出的结果，不挂死主线程。
  */
-export function recall(cfg, query, deadline = Infinity) {
+export function recall(cfg, query, deadline = Infinity, trace = null) {
   const qg = [...new Set(grams(query))]
+  if (trace) trace.queryGrams = qg.length
   if (qg.length === 0) return []
   if (Date.now() > deadline) return []
 
@@ -426,6 +441,7 @@ export function recall(cfg, query, deadline = Infinity) {
     if (ids === undefined) continue
     for (const id of ids) candidates.add(id)
   }
+  if (trace) trace.originalCandidates = [...candidates]
   const pool =
     candidates.size === 0
       ? entries
@@ -433,13 +449,16 @@ export function recall(cfg, query, deadline = Infinity) {
   const now = Date.now()
   const halfLife = cfg.halfLifeDays ?? 30
 
-  const scan = (bonus, bonusWeight) => {
+  // scan 必须显式接收要扫的池子。之前它闭包捕获 pool（原始查询候选集），
+  // 扩展重试扫的也是同一个池——于是「只含扩展词、不含原始 2-gram」的正确记忆
+  // 根本进不了评分。这是候选发现层的 bug，不是打分层的。
+  const scan = (scanPool, bonus, bonusWeight, allowExpansionOnly = false) => {
     const out = []
     let scanned = 0
-    for (const entry of pool) {
+    for (const entry of scanPool) {
       // 每 64 条查一次表：比逐条 Date.now() 便宜，又足够细粒度
       if ((scanned++ & 63) === 0 && Date.now() > deadline) break
-      const s = scoreEntry(qg, entry, model, now, halfLife, bonus, bonusWeight)
+      const s = scoreEntry(qg, entry, model, now, halfLife, bonus, bonusWeight, allowExpansionOnly)
       if (s.score > 0) {
         out.push({
           entry,
@@ -462,7 +481,7 @@ export function recall(cfg, query, deadline = Infinity) {
     return out
   }
 
-  const hits = scan(null, 0)
+  const hits = scan(pool, null, 0)
   const top = hits[0]
   // top 为空时**不能**直接 return。
   // 之前这里写的是 if (!top) return []，于是「原始 2-gram 一个都没命中」
@@ -486,9 +505,33 @@ export function recall(cfg, query, deadline = Infinity) {
   // 直接调低全局 minMatched 才是会把误召率一起打崩的做法。
   if (qg.length < 4) return []
   const expansion = expandWords(query)
+  if (trace) {
+    trace.expansionWords = [...expansion.words]
+    trace.expansionWeight = expansion.weight
+  }
   if (expansion.words.length === 0) return []
   const bonus = [...new Set(expansion.words.flatMap((w) => grams(w)))]
-  const retry = scan(bonus, expansion.weight)
+
+  // 受控并集：原始候选 ∪ 扩展词在倒排索引里的直接候选。
+  // 之前重试扫的是同一个原始 pool，弱原始匹配把正确记忆挡在外面；
+  // 现在两路候选各自从 gramIndex 取，再合并成重试池。
+  // 「受控」有两条：不退回全语料兜底，只收 gramIndex 真命中的条目；
+  // 原始零命中的纯扩展候选另受 PURE_EXPANSION_MIN_WEIGHT 与
+  // expansionMatched >= 2 两道闸约束。
+  const retryIds = new Set(candidates)
+  for (const g of bonus) {
+    const ids = gramIndex.get(g)
+    if (ids === undefined) continue
+    for (const id of ids) retryIds.add(id)
+  }
+  if (retryIds.size === 0) return []
+  const retryPool = [...retryIds].map((id) => byId.get(id)).filter(Boolean)
+  if (trace) {
+    trace.retryCandidates = [...retryIds]
+    trace.retryScanned = retryPool.length
+  }
+
+  const retry = scan(retryPool, bonus, expansion.weight, true)
   const rtop = retry[0]
   if (!rtop) return []
   // 证据分两层，不能混：
@@ -506,12 +549,40 @@ export function recall(cfg, query, deadline = Infinity) {
       (h) =>
         h.queryMatched + h.expansionMatched >= 2 &&
         h.expansionMatched >= 1 &&
-        // 试过放宽到 0.05：Recall 一动不动，无答案误召从 8.3% 涨到 12.5%。
-        // 说明覆盖率不是瓶颈，词表覆盖面才是，所以退回来。
-        h.coverage >= 0.1 &&
+        // 原始有命中时，覆盖率照旧过 0.1。
+        // 原始零命中（纯扩展捞回来）时覆盖率必然为 0，不能用同一个尺子量：
+        // 改看扩展证据——至少两个扩展片段命中，且只在 synonym 档（0.8）放行。
+        // 这两条一起替代「queryMatched ≥ 1」，避免重演 8.3% → 12.5% 的误召回退。
+        (h.queryMatched >= 1
+          ? h.coverage >= 0.1
+          : expansion.weight >= PURE_EXPANSION_MIN_WEIGHT && h.expansionMatched >= 2) &&
         h.rawScore >= rtop.rawScore * 0.5,
     )
     .slice(0, 1)
+}
+
+/**
+ * 只读诊断入口：返回 recall 的候选发现明细，**不改变 recall 的返回结构**。
+ *
+ * 存在的理由只有一个：候选池是否包含某条记忆，从 recall 的返回值里看不出来
+ * （回退通道最后只放行一条），而「正确记忆根本没进过评分」恰恰是本轮修掉的 bug。
+ * 测试需要一个能断言「进没进候选」的观察点，就放在这里，而不是往 recall 里塞调试字段。
+ *
+ * trace 字段：queryGrams / originalCandidates / expansionWords / expansionWeight /
+ * retryCandidates / retryScanned。都是数组或数字，不含记忆正文。
+ */
+export function recallDiagnostics(cfg, query, deadline = Infinity) {
+  const trace = {
+    query: String(query),
+    queryGrams: 0,
+    originalCandidates: [],
+    expansionWords: [],
+    expansionWeight: 0,
+    retryCandidates: [],
+    retryScanned: 0,
+  }
+  const hits = recall(cfg, query, deadline, trace)
+  return { hits, trace }
 }
 
 /**
