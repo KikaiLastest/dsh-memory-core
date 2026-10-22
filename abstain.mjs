@@ -112,9 +112,11 @@ function evidenceStrength(cov, matched, density, minCoverage, minMatched) {
  * @param {Array<object>} hits RecallHit[]，不要求已排序（这里自己排）
  * @param {string} query 原始查询，用来把分数按查询长度归一化
  * @param {object} [cfg] 覆盖 ABSTAIN_DEFAULTS 中的阈值
- * @returns {{verdict: 'answer'|'ambiguous'|'abstain', confidence: number, reason: string}}
- *   confidence 始终表示「这个答案本身有多可信」：abstain 恒为 0，
- *   ambiguous 落在中段，answer 才可能接近 1。
+ * @returns {{verdict: 'answer'|'ambiguous'|'abstain', evidenceStrength: number, reason: string}}
+ *   evidenceStrength 是**启发式证据强度**（过线之后的余量），不是校准概率；
+ *   abstain 恒为 0。它只在同一个 verdict 内部单调，
+ *   **不能跨 verdict 比较**：实测 answer 可以低到 0.393，而 ambiguous 可以高到 0.495。
+ *   旧字段 confidence 已删除——那个名字会被误读成「有 82% 概率正确」，本轮不再暴露。
  */
 export function decide(hits, query, cfg = {}) {
   const options = cfg || {}
@@ -126,12 +128,13 @@ export function decide(hits, query, cfg = {}) {
   const grams = gramCount(query)
 
   // evidenceStrength 是**启发式证据强度**，不是概率校准后的置信度。
-  // 「0.82」不代表「82% 概率正确」——它只是覆盖率、命中数、密度的加权组合。
-  // confidence 保留为同名字段，纯粹为了不破坏已有调用；新代码请用 evidenceStrength。
+  // 「0.82」不代表「82% 概率正确」——它只是覆盖率、命中数、密度的加权组合，
+  // 权重是手写的，没有任何标注数据拟合过。
+  // 跨 verdict 不可比：answer 的下限（0.393）低于 ambiguous 的上限（0.495），
+  // 所以 0.45 这个数字本身不说明「更该信哪一边」，展示时必须带上 verdict。
   const abstain = (reason) => ({
     verdict: VERDICT.ABSTAIN,
     evidenceStrength: 0,
-    confidence: 0,
     reason,
   })
 
@@ -193,7 +196,6 @@ export function decide(hits, query, cfg = {}) {
     return {
       verdict: VERDICT.AMBIGUOUS,
       evidenceStrength: s,
-      confidence: s,
       reason: REASON.CLOSE_CANDIDATES,
     }
   }
@@ -203,7 +205,6 @@ export function decide(hits, query, cfg = {}) {
   return {
     verdict: VERDICT.ANSWER,
     evidenceStrength: s,
-    confidence: s,
     reason: REASON.STRONG_EVIDENCE,
   }
 }
