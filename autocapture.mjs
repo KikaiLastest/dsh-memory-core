@@ -50,11 +50,23 @@ export function isWorthCapturing(text) {
  * @param {string} filePath
  * @returns {Array<Object>}
  */
+// 结果按 mtime + size 缓存：配额检查、召回、导航都会反复读同一个文件，
+// 每次全量 readFileSync + 逐行 JSON.parse，语料一多就是主线程上的 O(N) 风暴。
+const storeCache = new Map()
+
+/** 追加写入之后必须调用，否则同一毫秒内的写入会读到旧快照。 */
+export function invalidateCaptureCache(filePath) {
+  storeCache.delete(filePath)
+}
+
 export function readCaptureStore(filePath) {
   try {
-    if (!fs.existsSync(filePath)) return []
+    const st = fs.statSync(filePath)
+    const key = `${st.mtimeMs}:${st.size}`
+    const hit = storeCache.get(filePath)
+    if (hit && hit.key === key) return hit.records
     const content = fs.readFileSync(filePath, 'utf8')
-    return content
+    const records = content
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean)
@@ -66,6 +78,8 @@ export function readCaptureStore(filePath) {
         }
       })
       .filter(Boolean)
+    storeCache.set(filePath, { key, records })
+    return records
   } catch {
     return []
   }
@@ -79,12 +93,23 @@ export function readCaptureStore(filePath) {
  * @param {string} [todayStr] 格式 YYYY-MM-DD，默认今天
  * @returns {{ allowed: boolean, countToday: number, remaining: number }}
  */
-export function checkDailyQuota(storePath, dailyQuota = 10, todayStr = new Date().toISOString().slice(0, 10)) {
+// 按本地时区算日期。之前用 toISOString().slice(0,10) 是 UTC 日期，
+// UTC+8 的凌晨 0 点到 8 点会被算进前一天，配额在半夜错位重置。
+export function localDateStr(ts) {
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${m}-${day}`
+}
+
+export function checkDailyQuota(storePath, dailyQuota = 10, todayStr = localDateStr(Date.now())) {
   const records = readCaptureStore(storePath)
   let countToday = 0
   for (const r of records) {
-    const d = (r.created_at || r.createdAt || '').slice(0, 10)
-    if (d === todayStr) {
+    const raw = r.created_at || r.createdAt
+    if (!raw) continue
+    if (localDateStr(raw) === todayStr) {
       countToday += 1
     }
   }
@@ -141,7 +166,7 @@ export function autoCapture(options) {
     return { captured: false, reason: 'not_worth_capturing' }
   }
 
-  const todayStr = new Date(now).toISOString().slice(0, 10)
+  const todayStr = localDateStr(now)
   const quota = checkDailyQuota(storePath, dailyQuota, todayStr)
   if (!quota.allowed) {
     return { captured: false, reason: 'daily_quota_exceeded', countToday: quota.countToday }
@@ -175,6 +200,7 @@ export function autoCapture(options) {
   try {
     fs.mkdirSync(path.dirname(storePath), { recursive: true })
     fs.appendFileSync(storePath, JSON.stringify(record) + '\n', 'utf8')
+    invalidateCaptureCache(storePath)
     return { captured: true, record, remainingQuota: quota.remaining - 1 }
   } catch (err) {
     return { captured: false, reason: 'write_failed', error: err.message }

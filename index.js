@@ -140,19 +140,32 @@ function loadEntries(cfg) {
   return entries
 }
 
-function buildIdf(entries) {
+// BM25 的两个标准参数：k1 控制词频饱和速度，b 控制长度归一化强度（0 = 不归一化，1 = 完全归一化）
+const BM25_K1 = 1.2
+const BM25_B = 0.75
+
+function buildModel(entries) {
   const df = new Map()
+  let totalLen = 0
   for (const e of entries) {
+    totalLen += e.text.length
     for (const g of new Set(grams(e.text))) df.set(g, (df.get(g) || 0) + 1)
   }
   const N = Math.max(1, entries.length)
   const idf = new Map()
+  // 这个平滑保证 idf 严格大于 0：n 等于 N 时结果是 log(1 + 0.5/(N+0.5))，
+  // 很小但绝不是 0，所以下面不能用 || 兜底 —— 那才会把噪音频段抬成 1.0
   for (const [g, n] of df) idf.set(g, Math.log(1 + (N - n + 0.5) / (n + 0.5)))
-  return idf
+  return { idf, avgdl: Math.max(1, totalLen / N) }
 }
 
-function scoreEntry(queryGrams, entry, idf, now = Date.now(), halfLifeDays = 30) {
+function scoreEntry(queryGrams, entry, model, now = Date.now(), halfLifeDays = 30) {
+  const { idf, avgdl } = model
   const tf = entry.tf || new Map()
+  // 标准 BM25 长度归一化：以语料平均长度作基准按比例调整。
+  // 之前用 sqrt(dl) 直接做分母，1000 字的排障记录会被砍掉近八成得分，
+  // 系统性地偏爱碎片、歧视完整知识。
+  const lenNorm = 1 - BM25_B + BM25_B * (Math.max(1, entry.text.length) / avgdl)
   let score = 0
   let matched = 0
   let total = 0
@@ -162,10 +175,11 @@ function scoreEntry(queryGrams, entry, idf, now = Date.now(), halfLifeDays = 30)
     const f = tf.get(g) || 0
     if (f === 0) continue
     matched += 1
-    score += (idf.get(g) || 1) * ((f * 2.2) / (f + 1.2))
+    // 用 ?? 而不是 ||：idf 理论上可以合法地接近 0，|| 会把它替换成默认权重
+    score += (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
   }
   const coverage = total === 0 ? 0 : matched / total
-  const rawScore = score / Math.sqrt(Math.max(1, entry.text.length))
+  const rawScore = score
 
   // 权重半衰期衰减计算，参与排序但不删除
   const { finalScore, weight } = applyScoreDecay(rawScore, entry, now, halfLifeDays)
@@ -251,7 +265,7 @@ function loadCached(cfg) {
       set.add(entry.id)
     }
   }
-  cache = { key, entries: recallable, idf: buildIdf(recallable), byId, gramIndex, suppressed, idDrift }
+  cache = { key, entries: recallable, model: buildModel(recallable), byId, gramIndex, suppressed, idDrift }
   return cache
 }
 
@@ -265,7 +279,7 @@ function loadCached(cfg) {
 export function recall(cfg, query, deadline = Infinity) {
   const qg = [...new Set(grams(query))]
   if (qg.length === 0) return []
-  const { entries, idf, byId, gramIndex } = loadCached(cfg)
+  const { entries, model, byId, gramIndex } = loadCached(cfg)
   if (entries.length === 0) return []
   if (Date.now() > deadline) return []
   const candidates = new Set()
@@ -285,7 +299,7 @@ export function recall(cfg, query, deadline = Infinity) {
   for (const entry of pool) {
     // 每 64 条查一次表：比逐条 Date.now() 便宜，又足够细粒度
     if ((scanned++ & 63) === 0 && Date.now() > deadline) break
-    const s = scoreEntry(qg, entry, idf, now, halfLife)
+    const s = scoreEntry(qg, entry, model, now, halfLife)
     if (s.score > 0) {
       hits.push({
         entry,

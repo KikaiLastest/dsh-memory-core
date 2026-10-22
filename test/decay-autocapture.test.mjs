@@ -124,6 +124,17 @@ console.log('--- 2. 测试 autocapture.mjs ---')
   const stored = readCaptureStore(storePath)
   assert.equal(stored.length, 2, '文件中保存了 2 条有效记录')
 
+  // 缓存：同一份文件连续读两次应复用同一个数组，不再重复反序列化
+  const again = readCaptureStore(storePath)
+  assert.equal(again, stored, 'mtime/size 没变时应命中缓存')
+
+  // 但追加写入之后必须读到新快照 —— 缓存忘了失效就会静默丢数据
+  const r4 = autoCapture({ text: '记住端口用 8080', storePath, dailyQuota: 10, now: now + 86400000 })
+  assert.equal(r4.captured, true)
+  const afterWrite = readCaptureStore(storePath)
+  assert.notEqual(afterWrite, stored, '追加之后不能还返回旧快照')
+  assert.equal(afterWrite.length, 3, '追加之后应该读到 3 条')
+
   console.log('autocapture tests passed')
 }
 
