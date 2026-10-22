@@ -65,8 +65,10 @@ const now = {
   recall3: pick(/Recall@3\s*:\s*([\d.]+)%/, 'Recall@3'),
   mrr: pick(/MRR\s*:\s*([\d.]+)/, 'MRR'),
   noAnswerFp: pick(/无答案误召率\s*:\s*([\d.]+)%/, '无答案误召率'),
-  contaminated: pick(/受污染查询比例\s*:\s*([\d.]+)%/, '受污染查询比例'),
-  staleLeak: pick(/过期结果占比\s*:\s*([\d.]+)%/, '过期结果占比'),
+  // 指标在 eval-report.mjs 里统一过命名（旧名保留为对照表），这里两种叫法都认，
+  // 免得改名本身就把门禁卡死。
+  contaminated: pick(/(?:受污染查询比例|污染查询率)\s*:\s*([\d.]+)%/, '污染查询率'),
+  staleLeak: pick(/(?:过期结果占比|污染结果占比)\s*:\s*([\d.]+)%/, '污染结果占比'),
 }
 
 const fails = []
