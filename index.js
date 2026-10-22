@@ -243,6 +243,8 @@ function scoreEntry(queryGrams, entry, model, now = Date.now(), halfLifeDays = 3
 }
 
 let cache = { key: '', entries: [], idf: null }
+// 状态表降级只警告一次，不跟着每一轮召回刷屏
+let warnedDegraded = false
 
 /**
  * 读固化产物的状态表：source_id -> status。
@@ -282,7 +284,16 @@ function loadCached(cfg) {
   const entries = loadEntries(cfg)
 
   // 状态过滤：被取代 / 归档 / 草稿不进候选池（仍留在档案里供追溯）
-  const { bySourceId, byContentId } = loadStatusMap(cfg)
+  const statusStore = loadStatusMap(cfg)
+  // 状态表读不出来时系统仍在跑，但淘汰过滤是失效的。这种降级必须说出来，
+  // 不能让「我不知道这条记忆有没有被淘汰」悄悄等于「它还有效」。
+  if (statusStore.degraded && !warnedDegraded) {
+    warnedDegraded = true
+    console.warn(
+      `[dsh-memory-core] 状态表不可用（${statusStore.reason}），本轮召回没有应用淘汰过滤`,
+    )
+  }
+  const { bySourceId, byContentId } = statusStore
   let suppressed = 0
   let idDrift = 0
   const recallable = []

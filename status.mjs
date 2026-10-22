@@ -23,14 +23,6 @@ export function isRecallable(status) {
   return status === 'active'
 }
 
-function readText(file) {
-  try {
-    return fs.readFileSync(file, 'utf8')
-  } catch {
-    return ''
-  }
-}
-
 /**
  * 读固化产物的状态表。
  *
@@ -40,25 +32,45 @@ function readText(file) {
  * 返回两张表：
  *   byContentId  rec.id -> status      主键，内容身份，抗行号漂移
  *   bySourceId   source_id -> status   辅助，只用于发现「这条被编辑过」
+ *
+ * 另外返回 degraded / reason，用来区分三件完全不同的事：
+ *   missing    还没固化过，空表是正常状态
+ *   unreadable 文件在但读不出来（权限、锁、路径错）
+ *   corrupt    读到了但一行都解析不出来
+ * 后两种等于「我不知道这条记忆有没有被淘汰」。按兼容策略全放行的话，
+ * 被标成 superseded 的旧决策会整体回到上下文里。调用方至少要知道自己在降级运行。
  */
 export function loadStatusMap(cfg = {}) {
   const bySourceId = new Map()
   const byContentId = new Map()
   const file = cfg.structuredFile
-  if (!file) return { bySourceId, byContentId }
+  if (!file) return { bySourceId, byContentId, degraded: false, reason: 'not_configured' }
 
-  const text = readText(file)
-  if (!text) return { bySourceId, byContentId }
+  let text = ''
+  try {
+    text = fs.readFileSync(file, 'utf8')
+  } catch (err) {
+    const missing = err && err.code === 'ENOENT'
+    return {
+      bySourceId,
+      byContentId,
+      degraded: !missing,
+      reason: missing ? 'missing' : 'unreadable',
+    }
+  }
+  if (!text) return { bySourceId, byContentId, degraded: false, reason: 'missing' }
 
   const byMemId = new Map()
   const records = []
+  let brokenLines = 0
   for (const line of text.split('\n')) {
     if (!line.trim()) continue
     let rec
     try {
       rec = JSON.parse(line)
     } catch {
-      continue // 单行损坏不该让整张状态表失效
+      brokenLines += 1 // 单行损坏不该让整张状态表失效
+      continue
     }
     if (!rec || !rec.source_id) continue
     const status = typeof rec.status === 'string' ? rec.status : null
@@ -76,5 +88,12 @@ export function loadStatusMap(cfg = {}) {
     if (target.source_id) bySourceId.set(target.source_id, 'superseded')
     if (target.id) byContentId.set(target.id, 'superseded')
   }
-  return { bySourceId, byContentId }
+  // 一行都没读出来、却确实有坏行：这是整张表废了，不是「恰好没有记录」
+  const degraded = records.length === 0 && brokenLines > 0
+  return {
+    bySourceId,
+    byContentId,
+    degraded,
+    reason: degraded ? 'corrupt' : 'ok',
+  }
 }

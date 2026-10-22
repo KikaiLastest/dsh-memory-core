@@ -135,6 +135,26 @@ console.log('--- 2. 测试 autocapture.mjs ---')
   assert.notEqual(afterWrite, stored, '追加之后不能还返回旧快照')
   assert.equal(afterWrite.length, 3, '追加之后应该读到 3 条')
 
+  // 符号链接不能绕过「禁止写 memory/」的禁令。
+  // Windows 上建软链需要开发者模式或管理员权限，建不出来就跳过这项。
+  const memoryDir = path.join(TEST_DIR, 'memory')
+  fs.mkdirSync(memoryDir, { recursive: true })
+  const linkPath = path.join(TEST_DIR, 'sneaky-link.jsonl')
+  let linkCreated = false
+  try {
+    fs.symlinkSync(path.join(memoryDir, 'captured.jsonl'), linkPath)
+    linkCreated = true
+  } catch {
+    linkCreated = false
+  }
+  if (linkCreated) {
+    assert.throws(
+      () => autoCapture({ text: '记住端口用 8080', storePath: linkPath }),
+      /Security violation/,
+      '指向 memory/ 的符号链接也必须被拦住',
+    )
+  }
+
   console.log('autocapture tests passed')
 }
 

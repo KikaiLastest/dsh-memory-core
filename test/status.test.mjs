@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { recall } from '../index.js'
 import { consolidate } from '../consolidate.mjs'
+import { loadStatusMap } from '../status.mjs'
 
 // 打真实 recall 与真实 consolidate，不复制任何实现。
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'status-'))
@@ -198,6 +199,28 @@ consolidate({ dialogueFile, outputFile: structuredFile, watermarkFile })
 const afterLongDrift = recall(cfg, '超长的一节', Date.now() + 5000)
 const longHits = afterLongDrift.map((h) => h.entry.text).join('\n')
 assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，被取代的记录仍然不该召回')
+
+// ── 10. 状态表缺失 / 损坏 / 正常，必须是三种可区分的结果 ────────────
+// 兼容策略「没标过状态就放行」只对 missing 成立。文件明明在却读不出来，
+// 或者整张表一行都解析不出来，等于「不知道这条记忆有没有被淘汰」——
+// 这时候再全放行，被标成 superseded 的旧决策会整体回到上下文里。
+{
+  const missing = loadStatusMap({ structuredFile: path.join(dir, '根本没有这个文件.jsonl') })
+  assert.equal(missing.degraded, false, '文件不存在是正常状态，不算降级')
+  assert.equal(missing.reason, 'missing')
+
+  const corruptFile = path.join(dir, 'corrupt.jsonl')
+  fs.writeFileSync(corruptFile, '{这不是 json\n也,不是\n', 'utf8')
+  const corrupt = loadStatusMap({ structuredFile: corruptFile })
+  assert.equal(corrupt.degraded, true, '整表解析不出来必须报告降级')
+  assert.equal(corrupt.reason, 'corrupt')
+  assert.equal(corrupt.byContentId.size, 0)
+
+  const healthy = loadStatusMap({ structuredFile })
+  assert.equal(healthy.degraded, false, '正常状态表不该被判成降级')
+  assert.equal(healthy.reason, 'ok')
+  assert.ok(healthy.byContentId.size > 0)
+}
 
 fs.rmSync(dir, { recursive: true, force: true })
 console.log('status tests passed')

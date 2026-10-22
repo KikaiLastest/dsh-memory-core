@@ -139,6 +139,32 @@ export function checkDailyQuota(storePath, dailyQuota = 10, todayStr = localDate
  * @param {number} [options.now=Date.now()] 当前时间戳
  * @returns {{ captured: boolean, reason?: string, record?: Object }}
  */
+/**
+ * 解析路径的真实位置。文件还不存在时退一步解析父目录，
+ * 这样「先建软链、再往里写」的绕过手法也能被拦住。
+ */
+function realPathish(filePath) {
+  let current = path.resolve(filePath)
+  // 先解开软链本身。realpathSync 对「目标还不存在」的悬空链接会直接抛错，
+  // 那时它会退化成链接自己所在目录，绕过检查——所以要先 readlink 拿到目标。
+  try {
+    if (fs.lstatSync(current).isSymbolicLink()) {
+      current = path.resolve(path.dirname(current), fs.readlinkSync(current))
+    }
+  } catch {
+    /* 不是链接或读不到，按原路径继续 */
+  }
+  try {
+    return fs.realpathSync(current)
+  } catch {
+    try {
+      return path.join(fs.realpathSync(path.dirname(current)), path.basename(current))
+    } catch {
+      return current
+    }
+  }
+}
+
 export function autoCapture(options) {
   const {
     text,
@@ -155,8 +181,10 @@ export function autoCapture(options) {
     return { captured: false, reason: 'missing_arguments' }
   }
 
-  // 安全检查：坚决禁止写 memory 目录
-  const normalizedPath = path.normalize(path.resolve(storePath)).replace(/\\/g, '/')
+  // 安全检查：坚决禁止写 memory 目录。
+  // path.resolve 只看字面路径，一个指向 memory/ 的符号链接能轻松绕过去，
+  // 所以先把真实路径解出来再判。
+  const normalizedPath = realPathish(storePath).replace(/\\/g, '/')
   if (/(?:^|\/)memory(?:\/|$)/i.test(normalizedPath)) {
     throw new Error(`Security violation: autocapture is forbidden to write into memory directory: ${storePath}`)
   }
