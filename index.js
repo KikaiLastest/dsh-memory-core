@@ -427,6 +427,13 @@ function loadCached(cfg, deadline = Infinity) {
  * 到点主动放弃剩余计算、返回已算出的结果，不挂死主线程。
  */
 export function recall(cfg, query, deadline = Infinity, trace = null) {
+  // 未归一化的 cfg 会让 loadCached 里的 path.join(undefined, ...) 抛 TypeError，
+  // 对调用方来说「配置不全」应当退化成「没有可召回内容」，而不是崩掉整条注入链。
+  // 只在配置明显不可用时兜底归一化：无条件归一化会覆盖调用方显式传入的
+  // structuredFile / summaryStore 路径，让状态过滤读到另一份数据。
+  if (!cfg || typeof cfg !== 'object' || !cfg.memoryRoot) {
+    try { cfg = normalizeConfig(cfg) } catch { return [] }
+  }
   const qg = [...new Set(grams(query))]
   if (trace) trace.queryGrams = qg.length
   if (qg.length === 0) return []

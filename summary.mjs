@@ -205,6 +205,9 @@ function parseMarkdown(text, source, fallbackAt = null) {
         // 小节原文。摘要记录会带上它的内容哈希，这样即使标题被改、行号漂移，
         // 召回时也能靠内容身份找到「这条记忆是不是已经被淘汰了」。
         raw: current.raw.join('\n').trim(),
+        // 内容身份只取正文，不含标题行：状态表里记的是正文哈希，
+        // 用带标题的 raw 去算永远对不上，一旦行号漂移就会被判成「无状态」而复活。
+        contentId: idOf(current.body.join('\n').trim()),
       })
     }
     current = null
@@ -351,8 +354,11 @@ export function buildNav(cfg = {}, options = {}) {
   const entries = collectEntries(cfg, mdFiles).filter((entry) => {
     // 统一调用 status.mjs 的权威状态解析，覆盖内容身份与行号兜底，并支持降级保守控制
     const status = resolveEntryStatus({
-      contentId: entry.contentId,
-      text: entry.text,
+      // parseMarkdown 产出的正文在 raw 上，没有 contentId/text。
+      // 传 undefined 会让状态解析退化成纯行号匹配，一旦上方增删小节，
+      // 已被淘汰的内容就会从导航这个口子复活。
+      contentId: entry.contentId ?? null,
+      text: entry.text ?? entry.raw ?? '',
       sourceId: entry.source === 'dialogue' ? 'dialogue:' + entry.line : null,
       id: entry.source === 'dialogue' ? 'dialogue:' + entry.line : null,
     }, statusMap)
