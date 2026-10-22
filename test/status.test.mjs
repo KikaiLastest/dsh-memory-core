@@ -142,5 +142,26 @@ assert.ok(chain.includes(recC.source_id), '最新的方案 C 召回')
 assert.ok(!chain.includes(oldA.source_id), '最老的方案 A 不召回')
 assert.ok(!chain.includes(newB.source_id), '中间被取代的方案 B 不召回')
 
+// ── 8. 行号漂移：在对话记录开头插一节，所有 source_id 整体后移 ──────────
+// 旧记录的行号对不上了，但内容签名还能对上，状态必须继续生效。
+const inserted = [
+  '## 2026-10-19',
+  '',
+  '### 最开头补写的一节',
+  '',
+  '这是后来补写在文件最前面的一段历史内容，作用是把后面所有小节的行号整体往后推。',
+  '',
+  '',
+].join('\n')
+// 注意读当前文件而不是用 body 常量：第 7 步已经往文件尾部追加过「方案 C」那一节了
+const currentDialogue = fs.readFileSync(dialogueFile, 'utf8')
+fs.writeFileSync(dialogueFile, inserted + currentDialogue, 'utf8')
+consolidate({ dialogueFile, outputFile: structuredFile, watermarkFile })
+
+const driftHits = recall(cfg, '技术栈方案', Date.now() + 5000)
+const driftText = driftHits.map((h) => h.entry.text).join('\n')
+assert.ok(!driftText.includes('方案 A'), '行号漂移后被取代的记录仍然不该召回（内容签名兜底）')
+assert.ok(driftText.includes('方案 C'), '当前有效的方案 C 仍然召回')
+
 fs.rmSync(dir, { recursive: true, force: true })
 console.log('status tests passed')
