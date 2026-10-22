@@ -70,6 +70,83 @@ assert.deepEqual(
   `这些本地模块被发布包里的文件导入，但不在 files 清单里（装完会找不到）：\n  ${[...phantoms].join('\n  ')}`,
 )
 
+/** 极简 tar.gz 解包：只处理普通文件，跳过 pax 扩展头，防路径穿越。 */
+function extractTarGz(tarball, destDir) {
+  const buf = zlibMod.gunzipSync(fs.readFileSync(tarball))
+  const root = path.resolve(destDir)
+  let off = 0
+  let count = 0
+  while (off + 512 <= buf.length) {
+    const header = buf.subarray(off, off + 512)
+    if (header.every((b) => b === 0)) break
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '')
+    const size =
+      parseInt(header.subarray(124, 136).toString('utf8').replace(/\0.*$/, '').trim(), 8) || 0
+    const type = String.fromCharCode(header[156])
+    const dataStart = off + 512
+    const body = buf.subarray(dataStart, dataStart + size)
+    off = dataStart + Math.ceil(size / 512) * 512
+    // x/g/L/K 是 pax 扩展头和长文件名块，本身不是文件
+    if (type === 'x' || type === 'g' || type === 'L' || type === 'K') continue
+    if (!name || name.endsWith('/')) continue
+    const target = path.resolve(root, name)
+    if (target !== root && !target.startsWith(root + path.sep)) continue
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, body)
+    count += 1
+  }
+  assert.ok(count > 0, 'tarball 解出来是空的')
+}
+
+// 7) 真实发布包：npm pack 出 tarball、解开、从解出来的目录 import 入口。
+//    第 6 条是静态扫描，能抓「漏文件」；但用户拿到的是 tarball，
+//    不是工作区目录。只测工作区等于没测交付物。
+const os = await import('node:os')
+const zlibMod = await import('node:zlib')
+const { execFileSync } = await import('node:child_process')
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-pack-'))
+try {
+  // Windows 上 Node 18.20.2+ 起不允许 execFileSync 直接跑 .cmd（CVE-2024-27980 的修法），
+  // 所以这里走 cmd.exe /c；Linux/macOS 直接用 npm。
+  const packArgs = ['pack', '--json', '--pack-destination', tmp]
+  const out =
+    process.platform === 'win32'
+      ? execFileSync('cmd.exe', ['/c', 'npm', ...packArgs], {
+          cwd: root,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+      : execFileSync('npm', packArgs, {
+          cwd: root,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+  const info = JSON.parse(out)[0]
+  const tarball = path.join(tmp, info.filename)
+  assert.ok(fs.existsSync(tarball), 'npm pack 没有生成 tarball')
+
+  const extractDir = path.join(tmp, 'extract')
+  fs.mkdirSync(extractDir)
+  // 不调系统 tar：Windows 上是 bsdtar，它对 Temp 的 8.3 短路径（比如 ADMINI~1）
+  // 直接报 status 2，而开发时 bash 里那个 tar 是 MSYS 的完全另一套东西，
+  // 结果就是「我这儿能过、CI 上过不了」。用 zlib 自己解，三个平台行为一模一样。
+  extractTarGz(tarball, extractDir)
+  const pkgDir = path.join(extractDir, 'package')
+  assert.ok(fs.existsSync(pkgDir), 'tarball 里没有 package/ 目录')
+
+  // tarball 里必须真的带着清单声明的每一个运行时文件
+  for (const file of runtimeFiles) {
+    assert.ok(fs.existsSync(path.join(pkgDir, file)), `tarball 里缺 ${file}`)
+  }
+
+  // 从解出来的目录加载一次，这是用户安装后的真实路径
+  const installed = await import(pathToFileURL(path.join(pkgDir, pkg.main)).href)
+  assert.equal(typeof installed.apply, 'function', '安装产物里的入口没导出 apply')
+  assert.equal(typeof installed.recall, 'function', '安装产物里的入口没导出 recall')
+} finally {
+  fs.rmSync(tmp, { recursive: true, force: true })
+}
+
 console.log(
-  `pack tests passed (${(pkg.files || []).length} files, ${onDisk.length} test files, ${runtimeFiles.length} runtime imports checked)`,
+  `pack tests passed (${(pkg.files || []).length} files, ${onDisk.length} test files, ${runtimeFiles.length} runtime imports checked, tarball install verified)`,
 )

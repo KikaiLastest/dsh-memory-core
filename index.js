@@ -232,10 +232,11 @@ function scoreEntry(
   // 之前用 sqrt(dl) 直接做分母，1000 字的排障记录会被砍掉近八成得分，
   // 系统性地偏爱碎片、歧视完整知识。
   const lenNorm = 1 - BM25_B + BM25_B * (Math.max(1, entry.text.length) / avgdl)
-  let score = 0
-  // 原始命中数和扩展命中数必须分开记。
-  // 之前把扩展命中加进 matched、再把 matched 除以「原始 gram 总数」，
-  // 结果覆盖率可以算到 1 以上——这个数字当时就不再有意义了。
+  // 三种分数必须分开，混用会让诊断看错东西：
+  //   queryScore     原始查询贡献
+  //   expansionScore 同义词扩展贡献
+  //   preDecayScore  两者合并、还没做时间衰减的总分
+  let queryScore = 0
   let queryMatched = 0
   let total = 0
   for (const g of queryGrams) {
@@ -245,30 +246,44 @@ function scoreEntry(
     if (f === 0) continue
     queryMatched += 1
     // 用 ?? 而不是 ||：idf 理论上可以合法地接近 0，|| 会把它替换成默认权重
-    score += (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
+    queryScore += (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
   }
 
   // 扩展命中只贡献分数，绝不计入 queryMatched / coverage。
   let expansionMatched = 0
+  let expansionScore = 0
   if (bonusGrams && bonusGrams.length) {
     for (const g of bonusGrams) {
       const f = tf.get(g) || 0
       if (f === 0) continue
       expansionMatched += 1
-      score += bonusWeight * (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
+      expansionScore +=
+        bonusWeight * (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
     }
   }
 
+  // 扩展贡献最多和原始贡献持平（原始当 1 份，扩展当 1 份）。
+  // 一开始卡到 0.5，测出来会把真实改写查询一起打回去——
+  // 原始只重合一个片段时，扩展必然超过原始的一半，那是正常情况不是异常。
+  // 1.0 这个数也是实测的：Recall@3 回到 100%，无答案误召仍是 0。
+  const effectiveExpansion = Math.min(expansionScore, queryScore * 1.0)
+
   // 覆盖率恒等于「原始查询被覆盖的比例」，天然落在 0–1
   const coverage = total === 0 ? 0 : queryMatched / total
-  const rawScore = score
+  const preDecayScore = queryScore + effectiveExpansion
 
   // 权重半衰期衰减计算，参与排序但不删除
-  const { finalScore, weight } = applyScoreDecay(rawScore, entry, now, halfLifeDays)
+  const { finalScore, weight } = applyScoreDecay(preDecayScore, entry, now, halfLifeDays)
 
   return {
     score: finalScore,
-    rawScore,
+    // rawScore 保留是为了不破坏既有调用，它就是 preDecayScore。
+    // 但新代码请用 queryScore / expansionScore / preDecayScore，
+    // 名字才说得清每个数到底是什么。
+    rawScore: preDecayScore,
+    queryScore,
+    expansionScore,
+    preDecayScore,
     weight,
     coverage,
     matched: queryMatched,
