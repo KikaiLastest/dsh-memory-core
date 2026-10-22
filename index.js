@@ -101,6 +101,20 @@ function splitEntries(text, src, fileMtimeMs = null) {
   return out
 }
 
+function readJsonl(file) {
+  const out = []
+  for (const line of readText(file).split('\n')) {
+    const t = line.trim()
+    if (!t) continue
+    try {
+      out.push(JSON.parse(t))
+    } catch {
+      /* 单行损坏不该拖垮整张表 */
+    }
+  }
+  return out
+}
+
 function loadEntries(cfg) {
   const sources = [
     ['dialogue', cfg.dialogueFile],
@@ -134,6 +148,35 @@ function loadEntries(cfg) {
           permanent: Boolean(c.permanent),
         })
       }
+    }
+  }
+
+  // 后台摘要（P0d）的产物：每个小节一条「标题 + 首句」。
+  // 对话记录里够长的小节已经原样进了池子，这里只补没进池的那些，
+  // 否则同一段内容会被召回两次。顺带让「我不吃香菜」这类短偏好也能被搜到——
+  // 它们本来被 40 字门槛挡在门外，而摘要层没有这个门槛。
+  if (cfg.summaryStore && fs.existsSync(cfg.summaryStore)) {
+    const covered = new Set()
+    for (const e of entries) {
+      if (e.src === 'dialogue') covered.add('dialogue:' + e.line)
+    }
+    for (const s of readJsonl(cfg.summaryStore)) {
+      if (!s || !s.title) continue
+      if (s.source_id && covered.has(s.source_id)) continue
+      const text = s.summary ? s.title + '\n' + s.summary : s.title
+      if (text.length < 6) continue
+      entries.push({
+        id: s.id ? 'sum-' + s.id : 'sum-' + crypto.createHash('sha1').update(text).digest('hex').slice(0, 8),
+        src: 'summary',
+        line: 0,
+        // 摘要不是原文，内容哈希对不上；靠它自己的来源位置去查状态
+        sourceId: s.source_id || null,
+        text,
+        weight: 1.0,
+        createdAt: s.created_at || null,
+        created_at: s.created_at || null,
+        permanent: false,
+      })
     }
   }
 
@@ -205,6 +248,7 @@ function cacheKey(cfg) {
     path.join(cfg.memoryRoot, '生长', '状态.md'),
     path.join(cfg.memoryRoot, '生长', '生长记录.md'),
     cfg.autocaptureStore,
+    cfg.summaryStore,
     cfg.structuredFile,
   ].filter(Boolean)
 
@@ -236,6 +280,8 @@ function loadCached(cfg) {
     // 此时不套用旧状态，因为旧记录描述的是另一段文本。
     const contentStatus = byContentId.get(idOf(entry.text))
     let status = contentStatus
+    // 摘要条目的文本是压缩过的，内容哈希必然对不上原文，改用它的来源位置查
+    if (status === undefined && entry.sourceId) status = bySourceId.get(entry.sourceId)
     if (status === undefined && bySourceId.has(entry.id)) {
       idDrift += 1
       status = undefined

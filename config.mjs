@@ -9,6 +9,37 @@
  * 内部路径与细节仍然只在 cordis.patch.yml 里手动改，不摆在面板上。
  */
 
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+// 默认档案根的挑选顺序：环境变量 → 本机真实存在的 D 盘工作区 → 跨平台的 ~/dsh-workspace。
+// 以前这里写死 D:\dsh-workspace，Linux / macOS 上拿到的是一个永远不存在的路径，
+// 然后静默返回空档案，用户只会看到「记忆没有了」却没有任何报错。
+function pickExisting(candidates) {
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    try {
+      if (fs.existsSync(candidate)) return candidate
+    } catch {
+      /* 探测失败就试下一个 */
+    }
+  }
+  return candidates[candidates.length - 1]
+}
+
+const WORKSPACE_FALLBACK = path.join(os.homedir(), 'dsh-workspace')
+const DEFAULT_MEMORY_ROOT = pickExisting([
+  process.env.DSH_MEMORY_ROOT,
+  'D:\\dsh-workspace\\memory',
+  path.join(WORKSPACE_FALLBACK, 'memory'),
+])
+const DEFAULT_DIALOGUE_FILE = pickExisting([
+  process.env.DSH_MEMORY_DIALOGUE,
+  'D:\\dsh-workspace\\对话记录.md',
+  path.join(WORKSPACE_FALLBACK, '对话记录.md'),
+])
+
 /** 参数分组（面板按这个分节渲染）。 */
 export const GROUPS = [
   { id: 'paths', label: '档案来源', hint: '记忆从哪几个文件读；只读，这两个路径不会被写入。' },
@@ -29,7 +60,7 @@ export const FIELD_DEFS = [
   {
     key: 'memoryRoot',
     type: 'string',
-    default: 'D:\\dsh-workspace\\memory',
+    default: DEFAULT_MEMORY_ROOT,
     label: '档案根目录',
     hint: '日记、生长状态、生长记录都在这个目录下面。',
     group: 'paths',
@@ -37,7 +68,7 @@ export const FIELD_DEFS = [
   {
     key: 'dialogueFile',
     type: 'string',
-    default: 'D:\\dsh-workspace\\对话记录.md',
+    default: DEFAULT_DIALOGUE_FILE,
     label: '对话记录文件',
     hint: '召回时当普通语料读的 Markdown 文件。',
     group: 'paths',

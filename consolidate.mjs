@@ -52,7 +52,14 @@ export function sections(text) {
  * 只依赖入参，不读环境变量、不猜作者本机目录 —— 换一台机器、进测试用临时目录都能直接调用。
  * 路径齐全但文件不存在时直接抛错：静默当成空对话继续跑，会让人以为固化成功了。
  */
-export function consolidate({ dialogueFile, outputFile, watermarkFile, now = new Date() }) {
+export function consolidate({
+  dialogueFile,
+  outputFile,
+  watermarkFile,
+  now = new Date(),
+  // 记忆归属谁。以前写死「大肥鱼」，换个身份这套固化出来的记录就全错了。
+  subject = process.env.DSH_MEMORY_SUBJECT || '大肥鱼',
+} = {}) {
   for (const [name, value] of Object.entries({ dialogueFile, outputFile, watermarkFile })) {
     if (!value) throw new Error(`consolidate: 缺少 ${name}`)
   }
@@ -76,7 +83,7 @@ export function consolidate({ dialogueFile, outputFile, watermarkFile, now = new
     records.push({
       id,
       type: 'event',
-      subject: '大肥鱼',
+      subject,
       fact: title,
       event_time: s.date || now.toISOString().slice(0, 10),
       source_id: 'dialogue:' + s.line,
