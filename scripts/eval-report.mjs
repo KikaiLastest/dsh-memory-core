@@ -45,16 +45,16 @@ export const METRIC_DEFS = {
     den: '有答案查询数',
     unit: 'query',
   },
-  staleQueryRate: {
-    label: '污染查询率',
-    num: '返回结果里出现 forbid 明令禁止内容的查询数',
-    den: '全部查询数（含无答案查询）',
-    unit: 'query',
+  staleIdentityLeakRate: {
+    label: '过期身份泄漏率',
+    num: '返回结果中身份为 superseded/archived 的条数',
+    den: '全部返回结果条数',
+    unit: 'result',
   },
-  staleHitShare: {
-    label: '污染结果占比',
-    num: '命中 forbid 内容的返回结果条数（一条结果含多个禁用词只算 1）',
-    den: '全部返回结果条数（所有查询 hit 之和）',
+  contentPollutionRate: {
+    label: '内容污染率',
+    num: '返回结果中命中 forbid 内容、且身份不是该查询期望答案的条数',
+    den: '全部返回结果条数',
     unit: 'result',
   },
   noAnswerFpRate: {
@@ -63,12 +63,26 @@ export const METRIC_DEFS = {
     den: '无答案查询数（expect 为 null）',
     unit: 'query',
   },
+  staleQueryRate: {
+    label: '旧口径·污染查询率（子串）',
+    num: '返回结果文本里出现 forbid 子串的查询数（已弃用，仅对照）',
+    den: '全部查询数（含无答案查询）',
+    unit: 'query',
+  },
+  staleHitShare: {
+    label: '旧口径·污染结果占比（子串）',
+    num: '命中 forbid 子串的返回结果条数，一条结果多个禁用词只算 1（已弃用，仅对照）',
+    den: '全部返回结果条数（所有查询 hit 之和）',
+    unit: 'result',
+  },
 }
 
 export const FAILURE_KINDS = {
   emptyRecall: '空召回：有答案但返回 0 条',
   misrank: '有结果但排序错：正确条目不在 top-K',
-  stale: '污染：返回了 forbid 明令禁止的内容',
+  stale: '旧口径污染：文本里出现 forbid 子串（已弃用，仅对照）',
+  staleIdentity: '过期身份泄漏：返回了 superseded/archived 记录',
+  contentPollution: '内容污染：返回了 forbid 内容所属条目（按身份判定）',
   noAnswer: '无答案误召：语料里没答案却给了结果',
 }
 
@@ -102,7 +116,13 @@ export function assertCases(cases) {
  * 唯一一份打分实现。
  * @param {{cases:object[], recallFn:(q:string)=>object[], topK?:number}} opts
  */
-export function scoreCases({ cases, recallFn, topK = 3 }) {
+export function scoreCases({
+  cases,
+  recallFn,
+  topK = 3,
+  identity = null,
+  staleStatuses = ['superseded', 'archived'],
+} = {}) {
   assertCases(cases)
   let hit1 = 0
   let hit3 = 0
@@ -115,8 +135,22 @@ export function scoreCases({ cases, recallFn, topK = 3 }) {
   let staleResultRows = 0
   let staleTermHits = 0
   let noAnswerFp = 0
+  let staleIdentityRows = 0
+  let staleIdentityQueries = 0
+  let contentPollutionRows = 0
+  let contentPollutionQueries = 0
+  let unidentifiedHits = 0
+  let unknownStatusHits = 0
   const failures = []
-  const byKind = { emptyRecall: 0, misrank: 0, stale: 0, noAnswer: 0 }
+  const byKind = {
+    emptyRecall: 0,
+    misrank: 0,
+    stale: 0,
+    staleIdentity: 0,
+    contentPollution: 0,
+    noAnswer: 0,
+  }
+  const legacyOnlyFalsePositives = []
   const sceneMap = new Map()
 
   for (const c of cases) {
@@ -132,6 +166,10 @@ export function scoreCases({ cases, recallFn, topK = 3 }) {
         hit3: 0,
         mrrSum: 0,
         staleQueries: 0,
+        staleIdentityQueries: 0,
+        contentPollutionQueries: 0,
+        unidentifiedHits: 0,
+        unknownStatusHits: 0,
         noAnswerFp: 0,
       })
     }
@@ -156,15 +194,98 @@ export function scoreCases({ cases, recallFn, topK = 3 }) {
       staleResultRows += rowIdx.size
       staleTermHits += hitTerms.length
       s.staleQueries += 1
-      byKind.stale += 1
-      failures.push({
-        kind: 'stale',
-        scene,
-        query: c.q,
-        expected: null,
-        detail: '不该出现: ' + hitTerms.join(', '),
-        got: texts.map((t) => t.slice(0, 14)),
+      // 旧子串口径只保留计数做对照；传了 identity 时不再用它产生失败条目，
+      // 否则「正确的新条目正文引用旧词」会被误报成污染。
+      if (!identity) {
+        byKind.stale += 1
+        failures.push({
+          kind: 'stale',
+          scene,
+          query: c.q,
+          expected: null,
+          detail: '不该出现: ' + hitTerms.join(', '),
+          got: texts.map((t) => t.slice(0, 14)),
+        })
+      }
+    }
+
+    // 身份维度：不看文本里有没有禁用词，看返回的到底是哪条记录。
+    // 过期身份泄漏和内容污染分开计数，各自有分子/分母，不合并成一个「污染率」。
+    if (identity) {
+      const rowKeys = hits.map((h) => identity.keysOf(h))
+      const rowStatuses = rowKeys.map((keys) => identity.statusOf(keys))
+      const carriers = identity.carrierKeysOf(c)
+      const expectedIds = identity.expectedKeysOf(c)
+      const leakRows = []
+      const pollutedRows = []
+
+      rowKeys.forEach((keys, i) => {
+        if (keys.length === 0) {
+          // 没有身份就无法证明安全，单独计数；硬门禁会检查这个盲区。
+          unidentifiedHits += 1
+          s.unidentifiedHits += 1
+          return
+        }
+        const status = rowStatuses[i]
+        if (status === null || status === 'unknown') {
+          unknownStatusHits += 1
+          s.unknownStatusHits += 1
+        }
+        if (staleStatuses.includes(status)) leakRows.push(i)
+        const isExpected = keys.some((k) => expectedIds.has(k))
+        const isCarrier = keys.some((k) => carriers.has(k))
+        if (isCarrier && !isExpected) pollutedRows.push(i)
       })
+
+      if (leakRows.length) {
+        staleIdentityRows += leakRows.length
+        staleIdentityQueries += 1
+        s.staleIdentityQueries += 1
+        byKind.staleIdentity += 1
+        failures.push({
+          kind: 'staleIdentity',
+          scene,
+          query: c.q,
+          expected: c.expect,
+          detail:
+            '返回了已淘汰记录: ' +
+            leakRows.map((i) => identity.labelOf(hits[i]) + '(' + rowStatuses[i] + ')').join(', '),
+          got: leakRows.map((i) => texts[i].slice(0, 14)),
+        })
+      }
+
+      if (pollutedRows.length) {
+        contentPollutionRows += pollutedRows.length
+        contentPollutionQueries += 1
+        s.contentPollutionQueries += 1
+        byKind.contentPollution += 1
+        failures.push({
+          kind: 'contentPollution',
+          scene,
+          query: c.q,
+          expected: c.expect,
+          detail:
+            '返回了 forbid 内容所属条目: ' +
+            pollutedRows.map((i) => identity.labelOf(hits[i])).join(', '),
+          got: pollutedRows.map((i) => texts[i].slice(0, 14)),
+        })
+      }
+
+      // 旧口径误报：子串说「有污染」，但按身份既不是泄漏也不是内容污染。
+      // 典型例子是正确的新条目正文引用了旧词；这条审计是本次修复的核心证据。
+      if (hitTerms.length && leakRows.length === 0 && pollutedRows.length === 0) {
+        legacyOnlyFalsePositives.push({
+          scene,
+          query: c.q,
+          forbid: hitTerms,
+          reason: '子串命中的结果身份是期望答案或非承载条目，按身份不算污染',
+          rows: hits.map((h, i) => ({
+            id: identity.labelOf(h),
+            status: rowStatuses[i],
+            matchedForbidRows: rowIdx.has(i),
+          })),
+        })
+      }
     }
 
     if (c.expect === null) {
@@ -232,9 +353,16 @@ export function scoreCases({ cases, recallFn, topK = 3 }) {
     recallAt3: rate(hit3, answerable),
     mrr: rate(mrrSum, answerable),
     emptyRecallRate: rate(emptyRecalls, answerable),
+    // 没有 identity 判定器时新维度记 0/0（value=null），不假装「0 泄漏」。
+    staleIdentityLeakRate: identity
+      ? rate(staleIdentityRows, totalHits)
+      : { value: null, numerator: 0, denominator: 0 },
+    contentPollutionRate: identity
+      ? rate(contentPollutionRows, totalHits)
+      : { value: null, numerator: 0, denominator: 0 },
+    noAnswerFpRate: rate(noAnswerFp, unanswerable),
     staleQueryRate: rate(staleQueries, cases.length),
     staleHitShare: rate(staleResultRows, totalHits),
-    noAnswerFpRate: rate(noAnswerFp, unanswerable),
   }
 
   const scenes = [...sceneMap.values()]
@@ -258,12 +386,39 @@ export function scoreCases({ cases, recallFn, topK = 3 }) {
       staleResultRows,
       staleTermHits,
       noAnswerFp,
+      staleIdentityRows,
+      staleIdentityQueries,
+      contentPollutionRows,
+      contentPollutionQueries,
+      unidentifiedHits,
+      unknownStatusHits,
     },
     metrics,
     scenes,
     failures,
     byKind,
     failureEntries: failures.length,
+    dimensions: {
+      identity: identity
+        ? {
+            available: true,
+            staleStatuses: [...staleStatuses],
+            oracle: typeof identity.describe === 'function' ? identity.describe() : null,
+          }
+        : { available: false, reason: '调用方未提供 identity 判定器' },
+      contentPollution: identity
+        ? { available: true, basis: 'carrier-identity' }
+        : { available: false, reason: '调用方未提供 identity 判定器' },
+    },
+    pollutionAudit: {
+      legacySubstringQueries: staleQueries,
+      legacySubstringRows: staleResultRows,
+      staleIdentityRows,
+      contentPollutionRows,
+      unidentifiedHits,
+      unknownStatusHits,
+      adjudicatedFalsePositives: legacyOnlyFalsePositives,
+    },
   }
 }
 
@@ -478,11 +633,16 @@ const displayWidth = (s) => [...s].reduce((w, ch) => w + (ch.codePointAt(0) > 0x
 const padDisplay = (s, n) => s + ' '.repeat(Math.max(0, n - displayWidth(s)))
 
 /** 文本报告：指标行由 METRIC_DEFS 生成，带分子/分母，不让读者猜。 */
-export function formatMetrics(metrics) {
+const LEGACY_METRIC_KEYS = new Set(['staleQueryRate', 'staleHitShare'])
+
+export function formatMetrics(metrics, { legacy = true } = {}) {
   const lines = []
   for (const [key, def] of Object.entries(METRIC_DEFS)) {
+    if (!legacy && LEGACY_METRIC_KEYS.has(key)) continue
     const v = metrics[key]
     if (!v) continue
+    // 旧调用方/旧数据没有身份维度：0/0 不渲染成「n/a」，直接略过。
+    if (v.denominator === 0 && v.value === null) continue
     const value = key === 'mrr' ? (v.value === null ? 'n/a' : v.value.toFixed(3)) : pct(v.value)
     // MRR 的分子是 1/rank 之和，不是条数，别写成 "65 / 133"
     const frac = key === 'mrr' ? v.numerator.toFixed(2) + ' 分 / ' + v.denominator : v.numerator + ' / ' + v.denominator
@@ -509,8 +669,12 @@ export function formatSceneTable(scenes) {
         (s.mrr.value === null ? 'n/a' : s.mrr.value.toFixed(3)) +
         ' 空召回=' +
         String(s.emptyRecalls).padStart(2) +
-        ' 污染=' +
-        String(s.staleQueries).padStart(2) +
+        (s.staleIdentityQueries === undefined
+          ? ' 污染=' + String(s.staleQueries).padStart(2)
+          : ' 身份泄漏=' +
+            String(s.staleIdentityQueries).padStart(2) +
+            ' 内容污染=' +
+            String(s.contentPollutionQueries).padStart(2)) +
         ' 误召=' +
         String(s.noAnswerFp).padStart(2),
     )
@@ -530,6 +694,10 @@ export function buildReport({ tool, kind, datasetId, datasetPath = null, cases, 
     emptyRecallRate: s.emptyRecallRate,
     emptyRecalls: s.emptyRecalls,
     staleQueries: s.staleQueries,
+    staleIdentityQueries: s.staleIdentityQueries,
+    contentPollutionQueries: s.contentPollutionQueries,
+    unidentifiedHits: s.unidentifiedHits,
+    unknownStatusHits: s.unknownStatusHits,
     noAnswerFp: s.noAnswerFp,
   }))
   return {
@@ -549,6 +717,8 @@ export function buildReport({ tool, kind, datasetId, datasetPath = null, cases, 
     metrics: scored.metrics,
     metricDefinitions: METRIC_DEFS,
     counts: scored.counts,
+    dimensions: scored.dimensions,
+    pollutionAudit: scored.pollutionAudit,
     failures: {
       entries: scored.failureEntries,
       byKind: scored.byKind,
