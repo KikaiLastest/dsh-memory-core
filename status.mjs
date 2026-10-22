@@ -33,6 +33,31 @@ export function titleFingerprint(text) {
 }
 
 /**
+ * 归一化标题指纹：第一行去掉 Markdown 井号，压平空白。
+ * 状态表里的 fact 就是固化那一刻的小节标题，用来做弱身份匹配。
+ */
+export function factFingerprint(text) {
+  const first =
+    String(text || '')
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map((l) => l.trim())
+      .find(Boolean) || ''
+  return first.replace(/^#+\s*/, '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/**
+ * 正文前缀指纹：跳过标题行，取正文前 48 个非空白字符。
+ * 行号会漂、标题可能被改，但正文开头是内容自己的影子，不受物理位置影响。
+ */
+export function bodyFingerprint(text, len = 48) {
+  const s = String(text || '').replace(/\r\n/g, '\n')
+  const idx = s.indexOf('\n')
+  if (idx < 0) return ''
+  return s.slice(idx + 1).replace(/\s+/g, '').slice(0, len)
+}
+
+/**
  * 降级保护下的 legacy 哨兵。
  *
  * 只有当状态表 `degraded` 且命中的记录确实没有 status 字段时才返回：
@@ -40,6 +65,15 @@ export function titleFingerprint(text) {
  * 它不会出现在 structured.jsonl 里；召回与导航共用 isRecallable，答案因此一致。
  */
 export const LEGACY_UNVERIFIED = 'legacy-unverified'
+
+/**
+ * 坐标漂移哨兵（严格身份模式）。
+ *
+ * 内容身份（contentId / 正文哈希）一个都没命中，只有 sourceId 坐标撞上了表里的记录。
+ * 行号会随编辑插入而漂移，位置不是身份：坐标撞上的很可能只是另一条小节。
+ * 返回该哨兵，让安全方向（不召回）生效；它和 LEGACY_UNVERIFIED 一样不出现在 structured.jsonl 里。
+ */
+export const UNVERIFIED_DRIFT = 'unverified-drift'
 
 /**
  * 解析任意记忆条目（原文小节、摘要或捕获项）在当前状态表中的权威状态。
@@ -57,9 +91,11 @@ export const LEGACY_UNVERIFIED = 'legacy-unverified'
  *
  * @param {Object} entry 记忆条目
  * @param {Object} statusMap loadStatusMap 返回的状态映射
- * @returns {string|null} 'active' | 'superseded' | 'archived' | 'draft' | 'legacy-unverified' | null(未受状态管理)
+ * @param {Object} [options]
+ * @param {boolean} [options.strictIdentity=false] 严格身份模式：坐标只用于识别漂移，不用于判定状态
+ * @returns {string|null} 'active' | 'superseded' | 'archived' | 'draft' | 'legacy-unverified' | 'unverified-drift' | null(未受状态管理)
  */
-export function resolveEntryStatus(entry, statusMap) {
+export function resolveEntryStatus(entry, statusMap, options = {}) {
   if (!entry || !statusMap) return null
   const byContentId = statusMap.byContentId
   const bySourceId = statusMap.bySourceId
@@ -98,9 +134,27 @@ export function resolveEntryStatus(entry, statusMap) {
   if (blocked !== null) return blocked
   if (active !== null) return degraded && legacyHit ? LEGACY_UNVERIFIED : active
 
-  // 3. 来源位置匹配（辅助兜底：行号命中且未被内容哈希覆盖）
+  // 3. 弱身份（仅严格模式）：标题 / 正文前缀。
+  //    行号会漂、标题可能被改写，但正文开头不会因为「上方插两行」而变化。
+  //    只对物理文件派生的条目（原文小节 / 摘要）生效：自动捕获不是状态表索引的
+  //    原文，不能因为一句相同的开场白就被套上别人的废弃状态。
+  if (options.strictIdentity && entry.text && isWeakEligible(entry)) {
+    const bodyHit = statusMap.byBody?.get(bodyFingerprint(entry.text))
+    if (bodyHit) consider(bodyHit.status, bodyHit.legacy)
+    const factHit = statusMap.byFact?.get(factFingerprint(entry.text))
+    if (factHit) consider(factHit.status, factHit.legacy)
+    if (blocked !== null) return blocked
+    if (active !== null) return degraded && legacyHit ? LEGACY_UNVERIFIED : active
+  }
+
+  // 4. 来源位置匹配（辅助兜底：行号命中且未被内容哈希覆盖）
+  // 严格身份模式（召回池）：走到这里说明内容身份一个都没命中。
+  // 此时坐标只是位置，不是身份——撞上的记录可能属于另一条小节，
+  // 「改个标题 + 上方插两行」就能借别人的 active 记录让旧决策还魂。
+  // 所以不再信任坐标，统一返回漂移哨兵，由调用方按不可召回处理。
   const src = entry.sourceId || entry.id
   if (src && bySourceId?.has(src)) {
+    if (options.strictIdentity) return UNVERIFIED_DRIFT
     consider(bySourceId.get(src), Boolean(legacySourceIds?.has(src)))
     if (blocked !== null) return blocked
     if (active !== null) return degraded && legacyHit ? LEGACY_UNVERIFIED : active
@@ -128,6 +182,12 @@ export function isRecallable(status, options = {}) {
   // 默认压掉，显式 conservative=false 才放行（给整表破损时留一个逃生口）。
   if (status === LEGACY_UNVERIFIED) {
     return !conservative
+  }
+
+  // 坐标漂移无法自证内容身份：位置证明不了「这条就是当时被治理的那条」，
+  // 即使状态表健康也不能放行，否则改标题 + 行号漂移即可复活旧事实。
+  if (status === UNVERIFIED_DRIFT) {
+    return false
   }
 
   // 显式废弃/归档/草稿，任何时候坚决不可召回
@@ -166,6 +226,7 @@ export function filterRecallableEntries(entries, statusMap, options = {}) {
   let suppressed = 0
   let unverified = 0
   let idDrift = 0
+  let driftSuppressed = 0
 
   const degraded = Boolean(statusMap && statusMap.degraded)
   // 和 isRecallable 同一个安全默认：降级时宁可少召回，不可放出过期决策
@@ -173,13 +234,15 @@ export function filterRecallableEntries(entries, statusMap, options = {}) {
   let legacySuppressed = 0
 
   for (const entry of entries) {
-    const status = resolveEntryStatus(entry, statusMap)
+    // 严格身份模式：内容哈希 / contentId 优先，坐标只用于识别漂移，不用于判定状态。
+    const status = resolveEntryStatus(entry, statusMap, { strictIdentity: true })
 
-    // 探测行号漂移：内容哈希没中，但物理坐标撞上了其他记录。
-    // 用的键必须和 resolveEntryStatus 第三层一致（sourceId 优先），否则统计会永远为 0。
-    const coordinate = entry.sourceId || entry.id
-    if (status === null && coordinate && statusMap && statusMap.bySourceId && statusMap.bySourceId.has(coordinate)) {
+    // 坐标撞上了记录，但内容身份对不上：位置漂移，按不可召回处理。
+    if (status === UNVERIFIED_DRIFT) {
       idDrift += 1
+      unverified += 1
+      driftSuppressed += 1
+      continue
     }
 
     if (!isRecallable(status, { degraded, conservative })) {
@@ -197,7 +260,28 @@ export function filterRecallableEntries(entries, statusMap, options = {}) {
     recallable.push(entry)
   }
 
-  return { recallable, suppressed, unverified, idDrift, legacySuppressed }
+  return { recallable, suppressed, unverified, idDrift, legacySuppressed, driftSuppressed }
+}
+
+/**
+ * 严格模式下允许使用弱身份（标题 / 正文前缀）的条目。
+ *
+ * 只认物理文件派生的条目：
+ * - 原文小节：id 形如 `<src>:<line>` 且 line > 0；
+ * - 摘要（src === 'summary'）：没有物理行，但标题继承自原文小节。
+ * 自动捕获（captured-*，line=0）不是状态表索引的原文，不套用弱身份，
+ * 否则用户刚批准的捕获会凭一句相同的开场白继承别人的废弃状态。
+ *
+ * @param {Object} entry 记忆条目
+ * @returns {boolean}
+ */
+function isWeakEligible(entry) {
+  if (!entry) return false
+  const line = Number(entry.line)
+  if (Number.isInteger(line) && line > 0 && typeof entry.src === 'string' && entry.id === entry.src + ':' + line) {
+    return true
+  }
+  return entry.src === 'summary'
 }
 
 export const VALID_STATUSES = new Set(['active', 'superseded', 'archived', 'draft'])
@@ -226,6 +310,8 @@ export const VALID_STATUSES = new Set(['active', 'superseded', 'archived', 'draf
  *   byContentId: Map<string, string>,
  *   legacyContentIds: Set<string>,
  *   legacySourceIds: Set<string>,
+ *   byBody: Map<string, {status: string, legacy: boolean}>,
+ *   byFact: Map<string, {status: string, legacy: boolean}>,
  *   degraded: boolean,
  *   reason: 'ok' | 'missing' | 'empty' | 'unreadable' | 'corrupt' | 'cycle_conflict' | 'dangling_reference' | 'partial_corrupt' | 'not_configured',
  *   totalRecords: number,
@@ -246,6 +332,8 @@ function emptyStatusMap(overrides) {
     byContentId: new Map(),
     legacyContentIds: new Set(),
     legacySourceIds: new Set(),
+    byBody: new Map(),
+    byFact: new Map(),
     degraded: false,
     reason: 'ok',
     totalRecords: 0,
@@ -430,6 +518,30 @@ export function loadStatusMap(cfg = {}) {
     }
   }
 
+  // ── 弱身份索引（仅供严格身份模式使用）──────────────────────────────
+  // 物理行号会漂、标题可能被改写，但正文开头 48 个字不会因为「上方插两行」而变化。
+  // 只有内容身份完全没命中时才启用，作为坐标之外的独立证据。
+  const byBody = new Map()
+  const byFact = new Map()
+  const addWeak = (map, key, status, legacy) => {
+    if (!key) return
+    const prev = map.get(key)
+    if (!prev) {
+      map.set(key, { status, legacy })
+      return
+    }
+    if (prev.status !== status) {
+      // 同一个弱指纹对应多条记录：取更严的一侧，不允许 active 洗白 superseded
+      prev.status = prev.status === 'active' ? status : prev.status
+    }
+    prev.legacy = prev.legacy && legacy
+  }
+  for (const { rec, status } of records) {
+    const legacy = legacyIds.has(rec.id)
+    addWeak(byBody, bodyFingerprint(rec.quote || ''), status, legacy)
+    addWeak(byFact, factFingerprint(rec.fact || rec.quote || ''), status, legacy)
+  }
+
   const badLines = syntaxErrors + schemaErrors + danglingRefs + cycleErrors
   const isCorrupt = records.length === 0 && badLines > 0
   const isPartialCorrupt = records.length > 0 && badLines > 0
@@ -451,6 +563,8 @@ export function loadStatusMap(cfg = {}) {
     byContentId,
     legacyContentIds: legacyIds,
     legacySourceIds,
+    byBody,
+    byFact,
     degraded,
     reason,
     // totalRecords 是「解析尝试过的非空行数」，和 validRecords 不是一回事：
