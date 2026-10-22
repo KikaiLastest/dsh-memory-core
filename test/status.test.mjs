@@ -296,6 +296,79 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
   assert.equal(danglingRes.degraded, true, '存在悬空替代引用必须标记降级')
   assert.equal(danglingRes.reason, 'dangling_reference')
   assert.equal(danglingRes.danglingRefs, 1, '准确统计 1 个悬空引用')
+
+  // ── 16. 非法 supersedes 假值逐项严格校验（"", 0, false, [] 等）──────────────
+  // 审查阻塞点 P0：不能让空值形式的非法 supersedes 绕过校验
+  const illegalFalsyValues = ['', 0, false, [], {}]
+  for (const badVal of illegalFalsyValues) {
+    const badFalsyFile = path.join(dir, `bad-falsy-${typeof badVal}.jsonl`)
+    fs.writeFileSync(
+      badFalsyFile,
+      JSON.stringify({ id: 'mem-falsy', source_id: 'dialogue:1', status: 'active', supersedes: badVal }) + '\n',
+      'utf8',
+    )
+    const falsyRes = loadStatusMap({ structuredFile: badFalsyFile })
+    assert.equal(falsyRes.degraded, true, `supersedes 传入 ${JSON.stringify(badVal)} 必须被判定为降级`)
+    assert.equal(falsyRes.schemaErrors, 1, `supersedes 传入 ${JSON.stringify(badVal)} 必须准确计入 schema 错误`)
+  }
+
+  // ── 17. 1000 节点超长替代链迭代遍历（Stack-Safe 爆栈防御测试）─────────────
+  const longChainFile = path.join(dir, 'long-chain.jsonl')
+  const chainLines = []
+  for (let i = 0; i < 1000; i++) {
+    const item = {
+      id: `mem-chain-${i}`,
+      source_id: `dialogue:${i + 1}`,
+      status: 'active',
+      supersedes: i < 999 ? `mem-chain-${i + 1}` : null,
+    }
+    chainLines.push(JSON.stringify(item))
+  }
+  fs.writeFileSync(longChainFile, chainLines.join('\n') + '\n', 'utf8')
+  const chainRes = loadStatusMap({ structuredFile: longChainFile })
+  assert.equal(chainRes.degraded, false, '1000 级合法长链绝不发生递归爆栈且判定健康')
+  assert.equal(chainRes.reason, 'ok')
+  assert.equal(chainRes.cycleErrors, 0)
+  assert.equal(chainRes.validRecords, 1000)
+  // 验证替代传递生效：链条尾部已被第一节点一路替代覆盖
+  assert.equal(chainRes.byContentId.get('mem-chain-999'), 'superseded')
+
+  // ── 18. 多环与分叉环路（Multi-cycle & Forked Cycles）────────────────────────
+  const multiCycleFile = path.join(dir, 'multi-cycle.jsonl')
+  fs.writeFileSync(
+    multiCycleFile,
+    [
+      // 环 1: A -> B -> A
+      JSON.stringify({ id: 'mem-c1-a', source_id: 'dialogue:1', status: 'active', supersedes: 'mem-c1-b' }),
+      JSON.stringify({ id: 'mem-c1-b', source_id: 'dialogue:2', status: 'active', supersedes: 'mem-c1-a' }),
+      // 环 2: C -> D -> E -> C
+      JSON.stringify({ id: 'mem-c2-c', source_id: 'dialogue:3', status: 'active', supersedes: 'mem-c2-d' }),
+      JSON.stringify({ id: 'mem-c2-d', source_id: 'dialogue:4', status: 'active', supersedes: 'mem-c2-e' }),
+      JSON.stringify({ id: 'mem-c2-e', source_id: 'dialogue:5', status: 'active', supersedes: 'mem-c2-c' }),
+    ].join('\n') + '\n',
+    'utf8',
+  )
+  const multiCycleRes = loadStatusMap({ structuredFile: multiCycleFile })
+  assert.equal(multiCycleRes.degraded, true)
+  assert.equal(multiCycleRes.reason, 'cycle_conflict')
+  assert.ok(multiCycleRes.cycleErrors >= 2, `多环场景必须捕获到全部环路，实际: ${multiCycleRes.cycleErrors}`)
+
+  // ── 19. 状态映射顺序无关性测试（Order Independence Verification）───────────
+  // 相同逻辑数据，顺写与逆写生成的映射必须 100% 相同
+  const recordsForward = [
+    { id: 'mem-order-1', source_id: 'dialogue:10', status: 'active' },
+    { id: 'mem-order-2', source_id: 'dialogue:10', status: 'superseded' }, // 相同物理坐标状态漂移
+    { id: 'mem-order-3', source_id: 'dialogue:20', status: 'active', supersedes: 'mem-order-1' },
+  ]
+  const fileFwd = path.join(dir, 'order-fwd.jsonl')
+  const fileRev = path.join(dir, 'order-rev.jsonl')
+  fs.writeFileSync(fileFwd, recordsForward.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+  fs.writeFileSync(fileRev, [...recordsForward].reverse().map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+
+  const resFwd = loadStatusMap({ structuredFile: fileFwd })
+  const resRev = loadStatusMap({ structuredFile: fileRev })
+  assert.deepEqual(Object.fromEntries(resFwd.byContentId), Object.fromEntries(resRev.byContentId), '内容身份映射必须顺序无关')
+  assert.deepEqual(Object.fromEntries(resFwd.bySourceId), Object.fromEntries(resRev.bySourceId), '来源坐标映射必须顺序无关')
 }
 
 fs.rmSync(dir, { recursive: true, force: true })
