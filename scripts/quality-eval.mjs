@@ -30,6 +30,7 @@ const corpus = [
   ['数据库选型', '数据库统一使用 PostgreSQL 15，连接串走环境变量注入，不写死在代码里，迁移脚本放在 migrations 目录下统一管理。'],
   ['被否决的方案', '不要用 MongoDB，之前试过一次，查询一致性达不到要求，后面所有新服务都不再考虑这个选项，已经写进技术选型规范。'],
   ['音乐播放器缓存', '音乐播放器的缓存策略是保留最近两百首，超出之后按最久未播放的顺序淘汰，缓存目录放在用户的可写数据目录下面。'],
+  ['服务端口', '服务监听的端口是 8443，前面有一层反向代理，证书统一由网关那边管理，不要在前端代码里写死这个数字。'],
 ]
 
 fs.writeFileSync(
@@ -66,8 +67,13 @@ const cases = [
   { q: '数据库用的什么', expect: 'PostgreSQL', forbid: [] },
   { q: '还能不能用 mongo', expect: '不要用 MongoDB', forbid: [] },
   { q: '音乐缓存保留多少首', expect: '最近两百首', forbid: [] },
+  { q: '服务在哪个端口上', expect: '8443', forbid: [] },
+  { q: '数据库是什么牌子', expect: 'PostgreSQL', forbid: [] },
+  { q: '部署在什么机器上', expect: '生产机 10.0.0.9', forbid: ['测试机 10.0.0.5'] },
+  { q: 'mongo 现在还能用吗', expect: '不要用 MongoDB', forbid: [] },
   { q: '量子纠缠的退相干时间是多少', expect: null, forbid: [] },
   { q: '今天晚饭吃什么', expect: null, forbid: [] },
+  { q: '今天股市怎么样', expect: null, forbid: [] },
 ]
 
 let hit1 = 0

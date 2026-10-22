@@ -7,6 +7,7 @@ import { computeDecayedWeight, applyScoreDecay } from './decay.mjs'
 import { autoCapture, readCaptureStore } from './autocapture.mjs'
 import { buildNav, summarizeDialogue } from './summary.mjs'
 import { idOf, loadStatusMap, isRecallable, resolveEntryStatus, filterRecallableEntries, titleFingerprint } from './status.mjs'
+import { expandWords } from './syn.mjs'
 import {
   fieldDescriptors,
   groupDescriptors,
@@ -216,7 +217,7 @@ function buildModel(entries) {
   return { idf, avgdl: Math.max(1, totalLen / N) }
 }
 
-function scoreEntry(queryGrams, entry, model, now = Date.now(), halfLifeDays = 30) {
+function scoreEntry(queryGrams, entry, model, now = Date.now(), halfLifeDays = 30, bonusGrams = null) {
   const { idf, avgdl } = model
   const tf = entry.tf || new Map()
   // 标准 BM25 长度归一化：以语料平均长度作基准按比例调整。
@@ -235,6 +236,17 @@ function scoreEntry(queryGrams, entry, model, now = Date.now(), halfLifeDays = 3
     // 用 ?? 而不是 ||：idf 理论上可以合法地接近 0，|| 会把它替换成默认权重
     score += (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
   }
+  // 同义词扩展只帮忙加分，**不摊薄覆盖率**。
+  // 如果把它也算进 total，扩展得越多覆盖率越低，反而更难通过门槛。
+  if (bonusGrams && bonusGrams.length) {
+    for (const g of bonusGrams) {
+      const f = tf.get(g) || 0
+      if (f === 0) continue
+      matched += 1
+      score += 0.6 * (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
+    }
+  }
+
   const coverage = total === 0 ? 0 : matched / total
   const rawScore = score
 
@@ -376,35 +388,58 @@ export function recall(cfg, query, deadline = Infinity) {
     candidates.size === 0
       ? entries
       : [...candidates].map((id) => byId.get(id)).filter(Boolean)
-  const hits = []
   const now = Date.now()
   const halfLife = cfg.halfLifeDays ?? 30
-  let scanned = 0
-  for (const entry of pool) {
-    // 每 64 条查一次表：比逐条 Date.now() 便宜，又足够细粒度
-    if ((scanned++ & 63) === 0 && Date.now() > deadline) break
-    const s = scoreEntry(qg, entry, model, now, halfLife)
-    if (s.score > 0) {
-      hits.push({
-        entry,
-        score: s.score,
-        rawScore: s.rawScore,
-        weight: s.weight,
-        coverage: s.coverage,
-        matched: s.matched,
-      })
+
+  const scan = (bonus) => {
+    const out = []
+    let scanned = 0
+    for (const entry of pool) {
+      // 每 64 条查一次表：比逐条 Date.now() 便宜，又足够细粒度
+      if ((scanned++ & 63) === 0 && Date.now() > deadline) break
+      const s = scoreEntry(qg, entry, model, now, halfLife, bonus)
+      if (s.score > 0) {
+        out.push({
+          entry,
+          score: s.score,
+          rawScore: s.rawScore,
+          weight: s.weight,
+          coverage: s.coverage,
+          matched: s.matched,
+        })
+      }
     }
+    out.sort((a, b) => b.score - a.score)
+    return out
   }
-  hits.sort((a, b) => b.score - a.score)
+
+  const hits = scan(null)
   const top = hits[0]
   if (!top) return []
   const floor = Math.max(cfg.minScore || 0.02, top.score * (cfg.minRatio || 0.3))
   // 用 ?? 而不是 ||：minCoverage 允许调到 0（只要命中就算），|| 会把 0 悄悄换成默认值
   const minCoverage = cfg.minCoverage ?? 0.2
   const minMatched = cfg.minMatched ?? 2
-  return hits
-    .filter((h) => h.score >= floor && h.coverage >= minCoverage && h.matched >= minMatched)
-    .slice(0, cfg.topK)
+  const strict = hits.filter(
+    (h) => h.score >= floor && h.coverage >= minCoverage && h.matched >= minMatched,
+  )
+  if (strict.length > 0) return strict.slice(0, cfg.topK)
+
+  // 受控回退：严格门槛下一条都不剩，而查询本身不是两个字的口头语。
+  // 拿同义词表把查询扩一次再扫，扩展词只加分、不摊薄覆盖率，
+  // 而且只放行一条、要求 matched 仍 ≥ 2。
+  // 这样「记住的说法和提问的说法对不上」能想起来，同时不会把寒暄放进来——
+  // 直接调低全局 minMatched 才是会把误召率一起打崩的做法。
+  if (qg.length < 4) return []
+  const extraWords = expandWords(query)
+  if (extraWords.length === 0) return []
+  const bonus = [...new Set(extraWords.flatMap((w) => grams(w)))]
+  const retry = scan(bonus)
+  const rtop = retry[0]
+  if (!rtop) return []
+  return retry
+    .filter((h) => h.matched >= 2 && h.coverage >= 0.1 && h.rawScore >= rtop.rawScore * 0.5)
+    .slice(0, 1)
 }
 
 function buildBlock(hits) {
