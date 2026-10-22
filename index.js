@@ -434,7 +434,9 @@ export function recall(cfg, query, deadline = Infinity, trace = null) {
   if (!cfg || typeof cfg !== 'object' || !cfg.memoryRoot) {
     try { cfg = normalizeConfig(cfg) } catch { return [] }
   }
-  const qg = [...new Set(grams(query))]
+  // 导出 API 不该因为调用方传了数字/对象就抛 TypeError 炸穿整条注入链，
+  // 非字符串按「没有可检索内容」处理。
+  const qg = [...new Set(grams(typeof query === 'string' ? query : String(query ?? '')))]
   if (trace) trace.queryGrams = qg.length
   if (qg.length === 0) return []
   if (Date.now() > deadline) return []

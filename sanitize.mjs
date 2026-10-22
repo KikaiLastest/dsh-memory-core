@@ -140,7 +140,12 @@ const MD_RULE_RE = /^([ \t]*)(-{3,}|={3,}|\*{3,}|_{3,})[ \t]*$/
  */
 export function hardenRecallText(text) {
   if (typeof text !== 'string' || text === '') return ''
-  return text
+  // 先清掉零宽 / 双向覆写 / 控制符，再逐行判断。
+  // 下面所有规则都靠 ^([ \t]*) 认行首，而 U+200B 不算空白：
+  // 只要在每行开头塞一个，伪造的 [memory-recall] 来源行和 ## 标题就能整行穿透。
+  const scrubbed = text.replace(INVISIBLE_RE, '')
+  if (scrubbed === '') return ''
+  return scrubbed
     .split(/\r?\n/)
     .map((line) => {
       let out = line
