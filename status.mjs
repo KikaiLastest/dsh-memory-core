@@ -287,23 +287,64 @@ export function loadStatusMap(cfg = {}) {
     byContentId.set(rec.id, status)
   }
 
-  // 关系链覆盖与引用完整性
+  // ── 有向图引用完整性、覆盖传递与环路检测（Cycle Detection）──────────────
+  const graph = new Map() // id -> supersedes_id
   for (const { rec } of records) {
     if (!rec.supersedes) continue
-    const target = byMemId.get(rec.supersedes)
-    if (!target) {
-      danglingRefs += 1
+    if (typeof rec.supersedes !== 'string' || !rec.supersedes.trim()) {
+      schemaErrors += 1
       continue
     }
+    const target = byMemId.get(rec.supersedes)
+    if (!target) {
+      danglingRefs += 1 // 悬空引用：指向不存在的目标记录
+      continue
+    }
+    graph.set(rec.id, rec.supersedes)
     if (target.source_id) bySourceId.set(target.source_id, 'superseded')
     if (target.id) byContentId.set(target.id, 'superseded')
   }
 
-  const badLines = syntaxErrors + schemaErrors
+  // 三色标记法检测有向环路：递归栈冲突即判定循环替代悖论（如 A -> B -> A）
+  const visitState = new Map() // 0: 未访, 1: 栈中, 2: 完成
+  let cycleErrors = 0
+  const hasCycle = (node, stack = new Set()) => {
+    if (stack.has(node)) return true
+    if (visitState.get(node) === 2) return false
+    stack.add(node)
+    visitState.set(node, 1)
+    const next = graph.get(node)
+    if (next && graph.has(next)) {
+      if (hasCycle(next, stack)) return true
+    }
+    stack.delete(node)
+    visitState.set(node, 2)
+    return false
+  }
+
+  for (const id of graph.keys()) {
+    if (!visitState.has(id)) {
+      if (hasCycle(id)) {
+        cycleErrors += 1
+      }
+    }
+  }
+
+  const badLines = syntaxErrors + schemaErrors + danglingRefs + cycleErrors
   const isCorrupt = records.length === 0 && badLines > 0
   const isPartialCorrupt = records.length > 0 && badLines > 0
   const degraded = isCorrupt || isPartialCorrupt
-  const reason = isCorrupt ? 'corrupt' : (isPartialCorrupt ? 'partial_corrupt' : 'ok')
+
+  let reason = 'ok'
+  if (isCorrupt) {
+    reason = 'corrupt'
+  } else if (cycleErrors > 0) {
+    reason = 'cycle_conflict'
+  } else if (danglingRefs > 0) {
+    reason = 'dangling_reference'
+  } else if (isPartialCorrupt) {
+    reason = 'partial_corrupt'
+  }
 
   return {
     bySourceId,
@@ -316,6 +357,7 @@ export function loadStatusMap(cfg = {}) {
     syntaxErrors,
     schemaErrors,
     danglingRefs,
+    cycleErrors,
     brokenLines: badLines,
   }
 }

@@ -268,6 +268,34 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
   assert.equal(badEnumRes.degraded, true, '包含非法 status 枚举必须标记降级')
   assert.equal(badEnumRes.schemaErrors, 1, '准确统计 1 个 schema 错误')
   assert.equal(badEnumRes.validRecords, 0)
+
+  // ── 14. 有向环路替代（Cycle Conflict：A -> B -> A）必须被精确捕获并降级 ──────
+  // 审查阻塞点 P0：不能容忍循环替代逻辑悖论
+  const cycleFile = path.join(dir, 'cycle.jsonl')
+  fs.writeFileSync(
+    cycleFile,
+    [
+      JSON.stringify({ id: 'mem-node-a', source_id: 'dialogue:1', status: 'active', supersedes: 'mem-node-b' }),
+      JSON.stringify({ id: 'mem-node-b', source_id: 'dialogue:2', status: 'active', supersedes: 'mem-node-a' }),
+    ].join('\n') + '\n',
+    'utf8',
+  )
+  const cycleRes = loadStatusMap({ structuredFile: cycleFile })
+  assert.equal(cycleRes.degraded, true, '存在有向环路必须标记降级')
+  assert.equal(cycleRes.reason, 'cycle_conflict', '原因必须准确标为 cycle_conflict')
+  assert.equal(cycleRes.cycleErrors, 1, '准确统计 1 个环路错误')
+
+  // ── 15. 悬空引用（Dangling Reference）必须触发降级保护 ───────────────────────
+  const danglingFile = path.join(dir, 'dangling.jsonl')
+  fs.writeFileSync(
+    danglingFile,
+    JSON.stringify({ id: 'mem-node-x', source_id: 'dialogue:1', status: 'active', supersedes: 'mem-non-existent' }) + '\n',
+    'utf8',
+  )
+  const danglingRes = loadStatusMap({ structuredFile: danglingFile })
+  assert.equal(danglingRes.degraded, true, '存在悬空替代引用必须标记降级')
+  assert.equal(danglingRes.reason, 'dangling_reference')
+  assert.equal(danglingRes.danglingRefs, 1, '准确统计 1 个悬空引用')
 }
 
 fs.rmSync(dir, { recursive: true, force: true })
