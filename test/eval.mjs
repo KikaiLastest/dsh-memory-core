@@ -53,94 +53,6 @@ const entries = [
   ...splitEntries(readText(path.join(root, '生长', '状态.md')), 'state'),
 ]
 
-const byId = new Map()
-const gramIndex = new Map()
-const df = new Map()
-for (const e of entries) {
-  const gs = grams(e.text)
-  const tf = new Map()
-  for (const g of gs) tf.set(g, (tf.get(g) || 0) + 1)
-  e.tf = tf
-  byId.set(e.id, e)
-  for (const g of new Set(gs)) {
-    df.set(g, (df.get(g) || 0) + 1)
-    let set = gramIndex.get(g)
-    if (!set) {
-      set = new Set()
-      gramIndex.set(g, set)
-    }
-    set.add(e.id)
-  }
-}
-const N = Math.max(1, entries.length)
-const idf = new Map()
-for (const [g, n] of df) idf.set(g, Math.log(1 + (N - n + 0.5) / (n + 0.5)))
-
-function overlap(queryGrams, entry) {
-  const tf = entry.tf
-  let matched = 0, total = 0
-  for (const g of queryGrams) {
-    if (STOP.has(g)) continue
-    total += 1
-    if ((tf.get(g) || 0) > 0) matched += 1
-  }
-  return total === 0 ? 0 : matched / total
-}
-
-function bm25(queryGrams, entry) {
-  const tf = entry.tf
-  let score = 0, matched = 0, total = 0
-  for (const g of queryGrams) {
-    if (STOP.has(g)) continue
-    total += 1
-    const f = tf.get(g) || 0
-    if (f === 0) continue
-    matched += 1
-    score += (idf.get(g) || 1) * ((f * 2.2) / (f + 1.2))
-  }
-  const coverage = total === 0 ? 0 : matched / total
-  return { score: score / Math.sqrt(Math.max(1, entry.text.length)), coverage, matched }
-}
-
-function recallA(q, topK = 3) {
-  const qg = [...new Set(grams(q))]
-  const hits = entries.map((e) => ({ entry: e, score: overlap(qg, e) })).filter((h) => h.score > 0)
-  hits.sort((a, b) => b.score - a.score)
-  return hits.slice(0, topK)
-}
-
-function recallB(q, topK = 3) {
-  const qg = [...new Set(grams(q))]
-  const hits = []
-  for (const e of entries) {
-    const s = bm25(qg, e)
-    if (s.score > 0) hits.push({ entry: e, ...s })
-  }
-  hits.sort((a, b) => b.score - a.score)
-  if (!hits.length) return []
-  const floor = Math.max(0.02, hits[0].score * 0.3)
-  return hits.filter((h) => h.score >= floor && h.coverage >= 0.2 && h.matched >= 2).slice(0, topK)
-}
-
-function recallC(q, topK = 3) {
-  const qg = [...new Set(grams(q))]
-  const cand = new Set()
-  for (const g of qg) {
-    const ids = gramIndex.get(g)
-    if (ids) for (const id of ids) cand.add(id)
-  }
-  const pool = cand.size ? [...cand].map((id) => byId.get(id)) : entries
-  const hits = []
-  for (const e of pool) {
-    const s = bm25(qg, e)
-    if (s.score > 0) hits.push({ entry: e, ...s })
-  }
-  hits.sort((a, b) => b.score - a.score)
-  if (!hits.length) return []
-  const floor = Math.max(0.02, hits[0].score * 0.3)
-  return hits.filter((h) => h.score >= floor && h.coverage >= 0.2 && h.matched >= 2).slice(0, topK)
-}
-
 const positives = entries
   .map((e) => ({ q: (e.text.split('\n')[0] || '').replace(/^#+\s*/, '').trim(), expect: e.id }))
   .filter((x) => x.q.length >= 3)
@@ -184,22 +96,30 @@ function evaluate(fn, name) {
   }
 }
 
-// 没有语料就明确失败。以前这里会算成 0/0 = NaN，打印一排 NaN% 然后 exit 0，
-// 于是「测试全绿」变成一句空话 —— 在别人机器上它压根没测任何东西。
+// 没有语料时分两种情况，不能一律 exit 1：
+// - npm test 的闸门必须在任何机器上都绿（干净 clone、CI、别人的电脑），
+//   所以无语料时打印 SKIPPED 然后 exit 0；
+// - npm run eval 是主动评测，没有语料就没有意义，必须 exit 1。
+const strict = process.argv.includes('--strict')
+
 if (entries.length === 0 || positives.length === 0) {
-  console.error(
-    `eval: 没有可用语料（entries=${entries.length}, positives=${positives.length}）。\n` +
-      '设置 DSH_MEMORY_ROOT / DSH_MEMORY_DIALOGUE，或在含「对话记录.md」的目录下运行。',
-  )
-  process.exit(1)
+  const detail = `entries=${entries.length}, positives=${positives.length}`
+  if (strict) {
+    console.error(
+      `eval: 没有可用语料（${detail}）。\n` +
+        '设置 DSH_MEMORY_ROOT / DSH_MEMORY_DIALOGUE，或在含「对话记录.md」的目录下运行。',
+    )
+    process.exit(1)
+  }
+  console.warn(`eval: SKIPPED —— 没有可用语料（${detail}）。要强制评测请跑 npm run eval`)
+  process.exit(0)
 }
 
+// 只评测生产实现：直接调 index.js 的 recall。
+// 这里曾经还有 A/B/C 三组实验对照，但它们各自重写了一份打分公式，生产代码换成标准
+// BM25 之后那三组还在跑老的 sqrt(dl)——等于给一个已经删掉的实现打分。对照的结论已经
+// 落到代码里了，留着只会误导。
 console.log('entries:', entries.length, '| positives:', positives.length)
-evaluate(recallA, 'A')
-evaluate(recallB, 'B')
-evaluate(recallC, 'C')
-
-// P 组才是生产实现：直接调 index.js 的 recall。前面三组只是实验对照，不算数。
 const prodCfg = {
   dialogueFile,
   memoryRoot: root,

@@ -18,7 +18,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { readCaptureStore } from './autocapture.mjs'
 import { sanitize } from './sanitize.mjs'
-import { loadStatusMap, isRecallable } from './status.mjs'
+import { idOf, loadStatusMap, isRecallable } from './status.mjs'
 
 const MAX_MD_BYTES = 512 * 1024
 const MAX_SEEN = 5000
@@ -343,9 +343,13 @@ export function buildNav(cfg = {}, options = {}) {
 
   // 导航和召回共用同一套状态判定：已经不参与召回的小节，也不该出现在常驻导航里。
   // 否则一条被淘汰的旧决策会从「召回」这个口子消失，又从「导航」那个口子回去。
-  const { bySourceId } = loadStatusMap(cfg)
+  const { bySourceId, byContentId } = loadStatusMap(cfg)
   const entries = collectEntries(cfg, mdFiles).filter((entry) => {
     if (entry.source !== 'dialogue') return true // 日记/捕获没有结构化状态，保持原样
+    // 和 recall 同一个查法：先认内容身份，行号只是兜底。
+    // 只查行号的话，原文一编辑、行号一漂移，被淘汰的旧决策就会从导航这个口子溜回来。
+    const byContent = byContentId.get(idOf(entry.text))
+    if (byContent !== undefined) return isRecallable(byContent)
     return isRecallable(bySourceId.get('dialogue:' + entry.line))
   })
   if (entries.length === 0) {
