@@ -145,17 +145,31 @@ export function filterRecallableEntries(entries, statusMap, options = {}) {
   return { recallable, suppressed, unverified, idDrift }
 }
 
+export const VALID_STATUSES = new Set(['active', 'superseded', 'archived', 'draft'])
+
 /**
  * 读固化产物的状态表。
  * 建立双向索引并输出明确的健康诊断状态。
+ *
+ * 状态机完备分类：
+ *   - 'missing': 文件未配置或文件不存在（ENOENT），属首次正常初始状态，不降级
+ *   - 'empty': 文件存在但内容为零字节或纯空白（截断/损坏），强制 degraded=true 保护
+ *   - 'unreadable': 文件存在但由于权限/锁读取失败，强制 degraded=true 保护
+ *   - 'corrupt': 存在非空行但全部记录解析或结构损坏，强制 degraded=true 保护
+ *   - 'partial_corrupt': 包含有效记录，但夹杂语法坏行、非法状态枚举或缺少契约，强制 degraded=true
+ *   - 'ok': 状态文件完整，且全部记录通过 schema 契约校验
  *
  * @param {Object} cfg 配置对象，需包含 structuredFile
  * @returns {{
  *   bySourceId: Map<string, string>,
  *   byContentId: Map<string, string>,
  *   degraded: boolean,
- *   reason: 'ok' | 'missing' | 'unreadable' | 'corrupt' | 'not_configured',
+ *   reason: 'ok' | 'missing' | 'empty' | 'unreadable' | 'corrupt' | 'partial_corrupt' | 'not_configured',
  *   totalRecords: number,
+ *   validRecords: number,
+ *   totalLines: number,
+ *   syntaxErrors: number,
+ *   schemaErrors: number,
  *   brokenLines: number
  * }}
  */
@@ -171,6 +185,10 @@ export function loadStatusMap(cfg = {}) {
       degraded: false,
       reason: 'not_configured',
       totalRecords: 0,
+      validRecords: 0,
+      totalLines: 0,
+      syntaxErrors: 0,
+      schemaErrors: 0,
       brokenLines: 0,
     }
   }
@@ -186,17 +204,27 @@ export function loadStatusMap(cfg = {}) {
       degraded: !missing,
       reason: missing ? 'missing' : 'unreadable',
       totalRecords: 0,
+      validRecords: 0,
+      totalLines: 0,
+      syntaxErrors: 0,
+      schemaErrors: 0,
       brokenLines: 0,
     }
   }
 
+  // 区分「文件不存在」与「文件存在但被截断为空」：
+  // 文件存在却为空说明经历了异常清空或截断，不能按首次运行的兼容策略放行
   if (!text.trim()) {
     return {
       bySourceId,
       byContentId,
-      degraded: false,
-      reason: 'missing',
+      degraded: true,
+      reason: 'empty',
       totalRecords: 0,
+      validRecords: 0,
+      totalLines: 0,
+      syntaxErrors: 0,
+      schemaErrors: 0,
       brokenLines: 0,
     }
   }
@@ -217,12 +245,32 @@ export function loadStatusMap(cfg = {}) {
       syntaxErrors += 1
       continue
     }
-    // 严格契约校验：缺少 id 或 source_id 的记录属于结构性坏数据，不能静默放过
-    if (!rec || typeof rec !== 'object' || !rec.id || !rec.source_id) {
+
+    // 严格契约校验：
+    // 1. 必须是对象且包含合法字符串 id 与 source_id
+    // 2. 状态值如果存在，必须落在合法枚举集合中；非法枚举不能被伪装成合法放行
+    // 3. 避免同一个文件内相同 id 发生非预期覆盖冲突
+    if (!rec || typeof rec !== 'object' || typeof rec.id !== 'string' || !rec.id.trim() || typeof rec.source_id !== 'string' || !rec.source_id.trim()) {
       schemaErrors += 1
       continue
     }
-    const status = typeof rec.status === 'string' ? rec.status : null
+
+    let status = null
+    if (rec.status !== undefined && rec.status !== null) {
+      if (typeof rec.status === 'string' && VALID_STATUSES.has(rec.status)) {
+        status = rec.status
+      } else {
+        // 非法 status 枚举值计入契约错误
+        schemaErrors += 1
+        continue
+      }
+    }
+
+    if (byMemId.has(rec.id)) {
+      schemaErrors += 1 // 重复 ID 冲突
+      continue
+    }
+
     records.push({ rec, status })
     byMemId.set(rec.id, rec)
     bySourceId.set(rec.source_id, status)

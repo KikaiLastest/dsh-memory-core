@@ -242,6 +242,32 @@ assert.ok(!longHits.includes('超长的一节'), '长文本 + 行号漂移后，
   assert.equal(partial.schemaErrors, 1, '准确统计 1 行缺少 source_id 的 schema 损坏')
   assert.equal(partial.brokenLines, 2, '总坏行数必须准确等于 2')
   assert.equal(partial.byContentId.get('mem-3'), 'superseded', '已解析出的淘汰关系仍然可用')
+
+  // ── 12. 零字节空文件与纯空白换行文件必须显式识别为 empty 并触发降级保护 ─────────
+  // 审查阻塞点 P0：不能把存在但为空的文件误判为首次运行的 missing！
+  const zeroByteFile = path.join(dir, 'zero-byte.jsonl')
+  fs.writeFileSync(zeroByteFile, '', 'utf8')
+  const emptyRes = loadStatusMap({ structuredFile: zeroByteFile })
+  assert.equal(emptyRes.degraded, true, '零字节文件必须被标记为降级状态')
+  assert.equal(emptyRes.reason, 'empty', '原因必须准确标为 empty')
+
+  const whitespaceFile = path.join(dir, 'whitespace.jsonl')
+  fs.writeFileSync(whitespaceFile, '   \n  \n\t  \n', 'utf8')
+  const wsRes = loadStatusMap({ structuredFile: whitespaceFile })
+  assert.equal(wsRes.degraded, true, '纯空白截断文件必须被标记为降级状态')
+  assert.equal(wsRes.reason, 'empty', '原因必须准确标为 empty')
+
+  // ── 13. 非法 status 枚举值必须被识别为 schema 错误并触发降级 ───────────────────
+  const badEnumFile = path.join(dir, 'bad-enum.jsonl')
+  fs.writeFileSync(
+    badEnumFile,
+    JSON.stringify({ id: 'mem-bad', source_id: 'dialogue:99', status: 'invalid_status_enum' }) + '\n',
+    'utf8',
+  )
+  const badEnumRes = loadStatusMap({ structuredFile: badEnumFile })
+  assert.equal(badEnumRes.degraded, true, '包含非法 status 枚举必须标记降级')
+  assert.equal(badEnumRes.schemaErrors, 1, '准确统计 1 个 schema 错误')
+  assert.equal(badEnumRes.validRecords, 0)
 }
 
 fs.rmSync(dir, { recursive: true, force: true })

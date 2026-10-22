@@ -29,12 +29,12 @@ function pickExisting(candidates) {
 }
 
 const WORKSPACE_FALLBACK = path.join(os.homedir(), 'dsh-workspace')
-const DEFAULT_MEMORY_ROOT = pickExisting([
+export const DEFAULT_MEMORY_ROOT = pickExisting([
   process.env.DSH_MEMORY_ROOT,
   'D:\\dsh-workspace\\memory',
   path.join(WORKSPACE_FALLBACK, 'memory'),
 ])
-const DEFAULT_DIALOGUE_FILE = pickExisting([
+export const DEFAULT_DIALOGUE_FILE = pickExisting([
   process.env.DSH_MEMORY_DIALOGUE,
   'D:\\dsh-workspace\\对话记录.md',
   path.join(WORKSPACE_FALLBACK, '对话记录.md'),
