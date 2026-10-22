@@ -3,6 +3,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { sanitize } from './sanitize.mjs'
 import { realPathish, assertSafeWritePath } from './fs-safe.mjs'
+import { idOf } from './status.mjs'
 
 /**
  * 筛选重要/值得保留的对话启发式规则。
@@ -19,6 +20,114 @@ const CAPTURE_PATTERNS = [
 const IGNORE_PATTERNS = [
   /^(?:在吗|你好|哈+|(?:谢谢|感谢)(?:你)?|好的|收到|ok|行|嗯|哦|66*)[!！。？?~～\s]*$/i,
 ]
+
+/**
+ * 规范化正文：去掉小节标题行与首尾空白，统一换行。
+ *
+ * 捕获副本通常是「整节正文里的一条用户消息」，原文小节却以 `### 标题` 开头。
+ * 算内容身份前必须先剥掉标题，否则同一句话在原文/摘要/捕获三个通道里会得到不同哈希。
+ * 只剥第一行标题，不碰正文里以 # 开头的代码或引用。
+ */
+export function canonicalBody(text) {
+  const normalized = String(text ?? '').replace(/\r\n?/g, '\n').trim()
+  return normalized.replace(/^#{1,6}[ \t]+[^\n]*(?:\n+|$)/, '').trim()
+}
+
+/** 正文内容身份：规范化正文的 sha1 前缀，和 status.mjs 的 idOf 同一套 mem- 格式。 */
+export function bodyId(text) {
+  return idOf(canonicalBody(text))
+}
+
+/** 匹配键：去掉全部空白，避免 Markdown 换行/缩进差异让同一句话对不上。 */
+function bodyMatchKey(text) {
+  return canonicalBody(text).replace(/\s+/g, '')
+}
+
+/**
+ * 读取一条捕获记录能追到的最强内容身份。
+ * 优先级：显式 contentId → 落盘时算好的 bodyId → 现算正文哈希。
+ * 旧版捕获记录没有 contentId/bodyId 时仍能靠正文哈希参与匹配。
+ */
+export function captureContentId(record) {
+  if (!record || typeof record !== 'object') return null
+  if (typeof record.contentId === 'string' && record.contentId) return record.contentId
+  if (typeof record.bodyId === 'string' && record.bodyId) return record.bodyId
+  if (typeof record.text === 'string' && record.text) return bodyId(record.text)
+  return null
+}
+
+/**
+ * 把捕获副本接到它所在的原文小节上。
+ *
+ * 状态表的键是 consolidate.mjs 写入的「整节原文（含标题）」哈希，不是正文哈希；
+ * 捕获记录只存一句话，单靠自身永远查不到状态表。这里在小节候选里按正文包含关系
+ * 找到出处，回填小节 contentId 与 sourceId，让 resolveEntryStatus 能沿用原有三层身份。
+ *
+ * 这是「建立 provenance」，不读状态表、不做淘汰判断——判定仍归 status.mjs。
+ *
+ * @param {Object} record 捕获记录（或任何带 text 的副本）
+ * @param {Array<Object>} candidates 原文候选（index.js 的 entries，src === 'dialogue' 的那些）
+ * @returns {{ contentId: string|null, sourceId: string|null }}
+ */
+export function linkCaptureToSource(record, candidates = []) {
+  const fallbackContentId = captureContentId(record)
+  const fallbackSourceId =
+    record && typeof record.sourceId === 'string' && record.sourceId.trim() ? record.sourceId.trim() : null
+  const key = bodyMatchKey(record && record.text)
+  if (key.length < 5) return { contentId: fallbackContentId, sourceId: fallbackSourceId }
+
+  let best = null
+  for (const entry of candidates) {
+    // line > 0 用来排除「已经被投影进池的捕获条目」：autoCapture 默认 source='dialogue'，
+    // 只看 src 会把上一条捕获当成原文小节，越链越偏。
+    if (!entry || entry.src !== 'dialogue' || Number(entry.line) <= 0 || typeof entry.text !== 'string') continue
+    const sectionKey = bodyMatchKey(entry.text)
+    if (!sectionKey || !sectionKey.includes(key)) continue
+    // 命中多个小节时取正文最短的那一个：包含的信息最少，最可能是这句话的出处。
+    // 长度相同再取行号更大的（更新的那条），避免指到早已被替换的旧段。
+    if (
+      !best ||
+      sectionKey.length < best.sectionKey.length ||
+      (sectionKey.length === best.sectionKey.length && Number(entry.line || 0) > Number(best.entry.line || 0))
+    ) {
+      best = { entry, sectionKey }
+    }
+  }
+
+  if (!best) return { contentId: fallbackContentId, sourceId: fallbackSourceId }
+  return {
+    // 必须回填「整节原文」的哈希，和 structured.jsonl 的 id 对齐；正文哈希在这里只是匹配键。
+    contentId: idOf(String(best.entry.text).trim()),
+    sourceId: best.entry.sourceId || best.entry.id || fallbackSourceId,
+  }
+}
+
+/**
+ * 把 JSONL 捕获记录投影成 index.js 候选池条目。
+ * 集成方在 index.js 的 captures 循环里用这一行替代原来的对象字面量即可：
+ *   entries.push(toCaptureEntry(c, entries))
+ * 候选池需要先装好 dialogue 条目，才能把捕获副本接到原文小节上。
+ *
+ * @param {Object} record 捕获记录
+ * @param {Array<Object>} candidates 已加载的候选条目
+ * @returns {Object|null}
+ */
+export function toCaptureEntry(record, candidates = []) {
+  if (!record || typeof record.text !== 'string') return null
+  const linked = linkCaptureToSource(record, candidates)
+  return {
+    id: record.id || 'captured:' + crypto.createHash('sha1').update(record.text).digest('hex').slice(0, 8),
+    src: record.source || 'autocapture',
+    line: 0,
+    text: record.text,
+    weight: record.weight !== undefined ? record.weight : 1.0,
+    createdAt: record.created_at || record.createdAt || null,
+    created_at: record.created_at || record.createdAt || null,
+    permanent: Boolean(record.permanent),
+    contentId: linked.contentId,
+    sourceId: linked.sourceId,
+  }
+}
 
 /**
  * 判断一条对话内容或用户消息是否值得自动捕获为长期/半衰记忆。
@@ -136,6 +245,8 @@ export function checkDailyQuota(storePath, dailyQuota = 10, todayStr = localDate
  * @param {number} [options.initialWeight=1.0] 初始权重 (0-1)
  * @param {boolean} [options.permanent=false] 是否永久不衰减
  * @param {string} [options.source='dialogue'] 来源
+ * @param {string} [options.contentId] 调用方已知的原文内容身份（status.mjs 的 mem- 哈希）
+ * @param {string} [options.sourceId] 调用方已知的来源坐标（如 dialogue:123）
  * @param {boolean} [options.redact=true] 写入前是否把常见密钥/token 脱敏成 [REDACTED]
  * @param {number} [options.now=Date.now()] 当前时间戳
  * @returns {{ captured: boolean, reason?: string, record?: Object }}
@@ -148,6 +259,8 @@ export function autoCapture(options) {
     initialWeight = 1.0,
     permanent = false,
     source = 'dialogue',
+    contentId: explicitContentId = null,
+    sourceId = null,
     redact = true,
     now = Date.now(),
   } = options || {}
@@ -180,6 +293,13 @@ export function autoCapture(options) {
   const rawText = text.trim()
   // 脱敏只影响落盘内容；是否值得捕获仍按原文的规则判断（避免密钥替换后误伤规则）。
   const storedText = redact === false ? rawText : sanitize(rawText)
+  // 身份和召回侧同一套算法：规范化正文（剥标题、去首尾空白）后取哈希。
+  // 捕获文本通常只是小节正文的一部分，所以这里先记「正文身份」；
+  // 读取侧 linkCaptureToSource 用它反查所在小节，再回填状态表认的整节 contentId。
+  const bodyContentId = bodyId(storedText)
+  const contentId =
+    typeof explicitContentId === 'string' && explicitContentId ? explicitContentId : bodyContentId
+  const recordSourceId = typeof sourceId === 'string' && sourceId.trim() ? sourceId.trim() : null
   const id = 'cap-' + crypto.createHash('sha1').update(storedText).digest('hex').slice(0, 12)
   const createdAt = new Date(now).toISOString()
 
@@ -192,6 +312,11 @@ export function autoCapture(options) {
     id,
     type: 'auto_capture',
     text: storedText,
+    // 追溯来源的两层身份：contentId 是对外内容身份，bodyId 是规范化正文哈希；
+    // sourceId 只在调用方确实知道物理坐标时写入，不知道就留 null，绝不猜。
+    contentId,
+    bodyId: bodyContentId,
+    sourceId: recordSourceId,
     // 用 isFinite 判断而不是 ||：initialWeight = 0 是合法的「不参与召回」，
     // 用 || 会把它悄悄改成 1.0，和之前情感状态吞掉 arousal=0 是同一个错误模式
     weight: Math.max(0, Math.min(1, Number.isFinite(Number(initialWeight)) ? Number(initialWeight) : 1.0)),
