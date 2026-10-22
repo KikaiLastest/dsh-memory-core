@@ -46,4 +46,30 @@ const onDisk = fs
 const missing = onDisk.filter((f) => !declared.has(f))
 assert.deepEqual(missing, [], `这些测试没进 npm test：${missing.join(', ')}`)
 
-console.log(`pack tests passed (${(pkg.files || []).length} files, ${onDisk.length} test files)`)
+// 6) 发布包必须带上入口真正 import 的每一个本地模块。
+//    只检查 files 里列的条目存不存在，是查不出来的 —— 反过来的漏洞才致命：
+//    syn.mjs 被 index.js 静态导入，但没写进 files，npm 发包时不会带上，
+//    用户装完就是 MODULE_NOT_FOUND。本地测试全绿也照样过。
+//    所以这里从源码的 import 反推，而不是从清单正推。
+const shipped = new Set(pkg.files || [])
+const localSpec = /from\s+['"]\.\/([^'"]+)['"]/g
+const runtimeFiles = (pkg.files || []).filter((f) => /\.(m?js)$/.test(f))
+const phantoms = new Set()
+for (const file of runtimeFiles) {
+  const full = path.join(root, file)
+  if (!fs.existsSync(full)) continue
+  const src = fs.readFileSync(full, 'utf8')
+  for (const m of src.matchAll(localSpec)) {
+    const dep = m[1]
+    if (!shipped.has(dep)) phantoms.add(`${file} -> ./${dep}`)
+  }
+}
+assert.deepEqual(
+  [...phantoms],
+  [],
+  `这些本地模块被发布包里的文件导入，但不在 files 清单里（装完会找不到）：\n  ${[...phantoms].join('\n  ')}`,
+)
+
+console.log(
+  `pack tests passed (${(pkg.files || []).length} files, ${onDisk.length} test files, ${runtimeFiles.length} runtime imports checked)`,
+)

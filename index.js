@@ -217,7 +217,15 @@ function buildModel(entries) {
   return { idf, avgdl: Math.max(1, totalLen / N) }
 }
 
-function scoreEntry(queryGrams, entry, model, now = Date.now(), halfLifeDays = 30, bonusGrams = null) {
+function scoreEntry(
+  queryGrams,
+  entry,
+  model,
+  now = Date.now(),
+  halfLifeDays = 30,
+  bonusGrams = null,
+  bonusWeight = 0.6,
+) {
   const { idf, avgdl } = model
   const tf = entry.tf || new Map()
   // 标准 BM25 长度归一化：以语料平均长度作基准按比例调整。
@@ -225,35 +233,48 @@ function scoreEntry(queryGrams, entry, model, now = Date.now(), halfLifeDays = 3
   // 系统性地偏爱碎片、歧视完整知识。
   const lenNorm = 1 - BM25_B + BM25_B * (Math.max(1, entry.text.length) / avgdl)
   let score = 0
-  let matched = 0
+  // 原始命中数和扩展命中数必须分开记。
+  // 之前把扩展命中加进 matched、再把 matched 除以「原始 gram 总数」，
+  // 结果覆盖率可以算到 1 以上——这个数字当时就不再有意义了。
+  let queryMatched = 0
   let total = 0
   for (const g of queryGrams) {
     if (STOP.has(g)) continue
     total += 1
     const f = tf.get(g) || 0
     if (f === 0) continue
-    matched += 1
+    queryMatched += 1
     // 用 ?? 而不是 ||：idf 理论上可以合法地接近 0，|| 会把它替换成默认权重
     score += (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
   }
-  // 同义词扩展只帮忙加分，**不摊薄覆盖率**。
-  // 如果把它也算进 total，扩展得越多覆盖率越低，反而更难通过门槛。
+
+  // 扩展命中只贡献分数，绝不计入 queryMatched / coverage。
+  let expansionMatched = 0
   if (bonusGrams && bonusGrams.length) {
     for (const g of bonusGrams) {
       const f = tf.get(g) || 0
       if (f === 0) continue
-      matched += 1
-      score += 0.6 * (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
+      expansionMatched += 1
+      score += bonusWeight * (idf.get(g) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lenNorm))
     }
   }
 
-  const coverage = total === 0 ? 0 : matched / total
+  // 覆盖率恒等于「原始查询被覆盖的比例」，天然落在 0–1
+  const coverage = total === 0 ? 0 : queryMatched / total
   const rawScore = score
 
   // 权重半衰期衰减计算，参与排序但不删除
   const { finalScore, weight } = applyScoreDecay(rawScore, entry, now, halfLifeDays)
 
-  return { score: finalScore, rawScore, weight, coverage, matched }
+  return {
+    score: finalScore,
+    rawScore,
+    weight,
+    coverage,
+    matched: queryMatched,
+    queryMatched,
+    expansionMatched,
+  }
 }
 
 let cache = { key: '', entries: [], idf: null }
@@ -391,13 +412,13 @@ export function recall(cfg, query, deadline = Infinity) {
   const now = Date.now()
   const halfLife = cfg.halfLifeDays ?? 30
 
-  const scan = (bonus) => {
+  const scan = (bonus, bonusWeight) => {
     const out = []
     let scanned = 0
     for (const entry of pool) {
       // 每 64 条查一次表：比逐条 Date.now() 便宜，又足够细粒度
       if ((scanned++ & 63) === 0 && Date.now() > deadline) break
-      const s = scoreEntry(qg, entry, model, now, halfLife, bonus)
+      const s = scoreEntry(qg, entry, model, now, halfLife, bonus, bonusWeight)
       if (s.score > 0) {
         out.push({
           entry,
@@ -406,6 +427,8 @@ export function recall(cfg, query, deadline = Infinity) {
           weight: s.weight,
           coverage: s.coverage,
           matched: s.matched,
+          queryMatched: s.queryMatched,
+          expansionMatched: s.expansionMatched,
         })
       }
     }
@@ -413,7 +436,7 @@ export function recall(cfg, query, deadline = Infinity) {
     return out
   }
 
-  const hits = scan(null)
+  const hits = scan(null, 0)
   const top = hits[0]
   if (!top) return []
   const floor = Math.max(cfg.minScore || 0.02, top.score * (cfg.minRatio || 0.3))
@@ -431,14 +454,25 @@ export function recall(cfg, query, deadline = Infinity) {
   // 这样「记住的说法和提问的说法对不上」能想起来，同时不会把寒暄放进来——
   // 直接调低全局 minMatched 才是会把误召率一起打崩的做法。
   if (qg.length < 4) return []
-  const extraWords = expandWords(query)
-  if (extraWords.length === 0) return []
-  const bonus = [...new Set(extraWords.flatMap((w) => grams(w)))]
-  const retry = scan(bonus)
+  const expansion = expandWords(query)
+  if (expansion.words.length === 0) return []
+  const bonus = [...new Set(expansion.words.flatMap((w) => grams(w)))]
+  const retry = scan(bonus, expansion.weight)
   const rtop = retry[0]
   if (!rtop) return []
+  // 证据分两层，不能混：
+  //   queryMatched ≥ 1  —— 原始查询至少得真的命中一个片段，
+  //                        扩展命中再多也不能凭空造出相关性；
+  //   queryMatched + expansionMatched ≥ 2 —— 合起来够两个片段才放行；
+  //   coverage ≥ 0.1 是原始覆盖率，不含扩展贡献。
   return retry
-    .filter((h) => h.matched >= 2 && h.coverage >= 0.1 && h.rawScore >= rtop.rawScore * 0.5)
+    .filter(
+      (h) =>
+        h.queryMatched >= 1 &&
+        h.queryMatched + h.expansionMatched >= 2 &&
+        h.coverage >= 0.1 &&
+        h.rawScore >= rtop.rawScore * 0.5,
+    )
     .slice(0, 1)
 }
 
