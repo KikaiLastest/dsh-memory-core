@@ -23,3 +23,22 @@ jobs:
         run: npm test
       - name: 发布包内容检查
         run: npm pack --dry-run
+
+  # 质量回归门禁：单独一个 job，不和上面的硬门禁混成一个绿灯。
+  #
+  # 冻结集 48.1% 是低基线，硬 gate 会把所有改进卡死，所以这里只做两件事：
+  #   1. 每次都把它跑出来、写进日志，让退化可见
+  #   2. 相对基线退化超过阈值就失败（不是要求它涨）
+  #
+  # 不在这里 gate 的东西：代码覆盖率、开发集（12 条，过拟合，没有参考价值）。
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: 冻结集指标（157 条，只观察不追涨）
+        run: node scripts/quality-frozen.mjs
+      - name: 相对基线检测明显退化
+        run: node scripts/quality-regression.mjs
