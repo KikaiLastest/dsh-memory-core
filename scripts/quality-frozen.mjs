@@ -4,6 +4,23 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { recall } from '../index.js'
 import { consolidate } from '../consolidate.mjs'
+import {
+  METRIC_DEFS,
+  FAILURE_KINDS,
+  FROZEN_MANIFEST,
+  auditCases,
+  buildReport,
+  digestCases,
+  digestFrozenDir,
+  emitReport,
+  formatMetrics,
+  formatSceneTable,
+  gitMeta,
+  parseJsonTarget,
+  printReportTail,
+  scoreCases,
+  verifyFrozen,
+} from './eval-report.mjs'
 
 /**
  * 冻结集评测。
@@ -14,6 +31,9 @@ import { consolidate } from '../consolidate.mjs'
  *   语料变了等于换了考卷，基线必须重测。
  *
  * 所以这个脚本只报数字，不设门禁、不许用它的结果去调权重。
+ *
+ * 指标口径、打分、JSON 报告都在 scripts/eval-report.mjs，和开发集共用一份实现，
+ * 避免同名指标两边分母不同。这里只负责跑、看、报。
  */
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -37,17 +57,18 @@ if (caseFiles.length === 0) {
 }
 
 const cases = []
+const corpusText = fs.readFileSync(corpusFile, 'utf8')
 for (const file of caseFiles) {
   const raw = fs.readFileSync(path.join(fixtures, file), 'utf8')
   let list
   try {
     list = JSON.parse(raw)
   } catch (e) {
-    console.error(`${file} 不是合法 JSON：${e.message}`)
+    console.error(file + ' 不是合法 JSON：' + e.message)
     process.exit(2)
   }
   if (!Array.isArray(list)) {
-    console.error(`${file} 应该是数组`)
+    console.error(file + ' 应该是数组')
     process.exit(2)
   }
   for (const c of list) cases.push({ ...c, scene: file.replace(/^frozen-/, '').replace(/\.json$/, '') })
@@ -91,92 +112,125 @@ const cfg = {
   halfLifeDays: 30,
 }
 
-const byScene = new Map()
-let hit1 = 0
-let hit3 = 0
-let mrr = 0
-let answerable = 0
-let staleQueries = 0
-let noAnswerFp = 0
-let unanswerable = 0
-let totalHits = 0
-let staleHitCount = 0
-const failures = []
+const scored = scoreCases({
+  cases,
+  recallFn: (q, topK) => recall({ ...cfg, topK }, q, Date.now() + 5000),
+  topK: cfg.topK,
+})
 
-for (const c of cases) {
-  if (!byScene.has(c.scene)) {
-    byScene.set(c.scene, { n: 0, hit1: 0, hit3: 0, mrr: 0, ans: 0, stale: 0, fp: 0, una: 0 })
-  }
-  const s = byScene.get(c.scene)
-  s.n += 1
+// 完整性：冻结集内容 + 阈值 + 评测侧的 prep 常量，任一漂移都说明基线和这次的数字不同卷。
+const measured = digestFrozenDir(fixtures)
+const harness = { superseded: [...SUPERSEDED].sort(), junkFacts: [...JUNK_FACTS].sort() }
+const integrityCheck = verifyFrozen(measured, cfg, harness)
+const labelAudit = auditCases(cases, corpusText)
+const gm = gitMeta(root)
+const jsonTarget = parseJsonTarget(process.argv.slice(2), 'quality-frozen.mjs')
 
-  const hits = recall(cfg, c.q, Date.now() + 5000)
-  const texts = hits.map((h) => h.entry.text)
-  totalHits += hits.length
-
-  const stale = (c.forbid || []).filter((f) => texts.some((t) => t.includes(f)))
-  if (stale.length) {
-    staleQueries += 1
-    staleHitCount += stale.length
-    s.stale += 1
-    failures.push(`[STALE][${c.scene}] ${c.q} -> 不该出现: ${stale.join(', ')}`)
-  }
-
-  if (c.expect === null) {
-    unanswerable += 1
-    s.una += 1
-    if (hits.length > 0) {
-      noAnswerFp += 1
-      s.fp += 1
-      failures.push(`[NOANSWER][${c.scene}] ${c.q} -> 本该空召回，实际 ${texts.length} 条`)
-    }
-    continue
-  }
-
-  answerable += 1
-  s.ans += 1
-  const rank = texts.findIndex((t) => t.includes(c.expect))
-  if (rank === 0) {
-    hit1 += 1
-    s.hit1 += 1
-  }
-  if (rank >= 0 && rank < 3) {
-    hit3 += 1
-    s.hit3 += 1
-  }
-  if (rank >= 0) {
-    mrr += 1 / (rank + 1)
-    s.mrr += 1 / (rank + 1)
-  }
-  if (rank < 0) {
-    failures.push(
-      `[MISS][${c.scene}] ${c.q} -> 期望「${c.expect}」，实际: ${texts.map((t) => t.slice(0, 14)).join(' | ') || '(空)'}`,
-    )
-  }
+const warnings = []
+if (gm.dirty) warnings.push('工作区有未提交改动 (' + gm.dirtyFiles + ' 个文件)，这次数字对应的不是干净的 commit')
+if (labelAudit.counts['short-expect']) {
+  warnings.push('标签体检: ' + labelAudit.counts['short-expect'] + ' 条 expect 只有 ≤4 字，越短越容易碰巧命中')
 }
+warnings.push(
+  '冻结集不设门禁：数字用于观察基线，不作通过条件；改动语料或阈值必须先跑 --rebaseline 并重新记录基线',
+)
 
-const pct = (n, d) => (d === 0 ? 'n/a' : ((n / d) * 100).toFixed(1) + '%')
+const report = buildReport({
+  tool: 'scripts/quality-frozen.mjs',
+  kind: 'frozen',
+  datasetId: 'frozen-157',
+  datasetPath: path.relative(root, fixtures).replace(/\\/g, '/'),
+  cases,
+  config: cfg,
+  scored,
+  integrity: {
+    ok: integrityCheck.ok,
+    mismatches: integrityCheck.mismatches,
+    fixtureDigest: measured.digest,
+    expectedFixtureDigest: FROZEN_MANIFEST.digest,
+    corpusDigest: measured.corpusDigest,
+    labelsDigest: digestCases(cases.map(({ scene, q, expect, forbid }) => ({ scene, q, expect, forbid }))),
+    samples: measured.samples,
+    expectedSamples: FROZEN_MANIFEST.samples,
+    answerable: measured.answerable,
+    unanswerable: measured.unanswerable,
+    files: measured.files,
+    harness,
+    configExpected: FROZEN_MANIFEST.config,
+    labelAudit,
+  },
+  warnings,
+})
+report.git = gm
+
+const pct = (v) => (v === null ? 'n/a' : (v * 100).toFixed(1) + '%')
+const fk = scored.byKind
+const failEntries = scored.failureEntries
 
 console.log('=== 冻结集基线 ===')
-console.log(`样本 ${cases.length} 条（有答案 ${answerable} / 无答案 ${unanswerable}）`)
-console.log('Recall@1      :', pct(hit1, answerable))
-console.log('Recall@3      :', pct(hit3, answerable))
-console.log('MRR           :', answerable === 0 ? 'n/a' : (mrr / answerable).toFixed(3))
-console.log('受污染查询比例:', pct(staleQueries, cases.length))
-console.log('过期结果占比  :', pct(staleHitCount, totalHits))
-console.log('无答案误召率  :', pct(noAnswerFp, unanswerable))
+console.log(
+  '样本 ' + cases.length + ' 条（有答案 ' + scored.counts.answerable + ' / 无答案 ' + scored.counts.unanswerable + '）' +
+    ' | 全部查询共返回 ' + scored.counts.totalHits + ' 条结果',
+)
+console.log('\n指标（分数 = 分子 / 分母，分母写在这里；实现见 scripts/eval-report.mjs METRIC_DEFS）:')
+for (const line of formatMetrics(scored.metrics)) console.log('  ' + line)
 
-console.log('\n--- 分场景 ---')
-for (const [scene, s] of [...byScene].sort()) {
+console.log('\n--- 口径对照（同一个量在不同文档里的旧叫法）---')
+console.log('  受污染查询比例(旧)          = 污染查询率   = ' + scored.counts.staleQueries + '/' + cases.length)
+console.log('  过期结果占比(旧)            = 污染结果占比 = ' + scored.counts.staleResultRows + '/' + scored.counts.totalHits)
+console.log(
+  '  旧口径的「过期结果占比」分子用的是「命中的禁用词数」(' + scored.counts.staleTermHits + ') 而不是结果条数，' +
+    '单位不一致，已在本次统一为结果条数；旧算法值 = ' + pct(scored.counts.totalHits ? scored.counts.staleTermHits / scored.counts.totalHits : null),
+)
+console.log('  过期记忆漏回率(旧, 开发集)  = 污染查询率（同一个量，只是叫法不同）')
+console.log(
+  '  过期事实泄漏 3/4%(FAILURE-ANALYSIS) = 污染查询数 / 失败条目数 = ' +
+    scored.counts.staleQueries + '/' + failEntries +
+    ' = ' + pct(failEntries ? scored.counts.staleQueries / failEntries : null),
+)
+
+console.log('\n--- 失败构成（' + failEntries + ' 个条目，可多条叠加在同一条查询上）---')
+for (const key of Object.keys(FAILURE_KINDS)) {
   console.log(
-    `${scene.padEnd(18)} n=${String(s.n).padStart(3)}  R@1=${pct(s.hit1, s.ans).padStart(6)}  R@3=${pct(s.hit3, s.ans).padStart(6)}  MRR=${s.ans ? (s.mrr / s.ans).toFixed(3) : 'n/a'}  污染=${s.stale}  误召=${s.fp}`,
+    '  ' + FAILURE_KINDS[key].padEnd(34) + ' ' + String(fk[key]).padStart(3) + '  ' +
+      pct(failEntries ? fk[key] / failEntries : null).padStart(6),
   )
 }
 
-if (failures.length) {
-  console.log(`\n--- 失败 ${failures.length} 条 ---`)
-  for (const f of failures) console.log(' ', f)
+console.log('\n--- 分场景 ---')
+for (const line of formatSceneTable(scored.scenes)) console.log(line)
+
+if (scored.failures.length) {
+  console.log('\n--- 失败明细 ' + scored.failures.length + ' 条 ---')
+  for (const f of scored.failures) {
+    const head = '  [' + f.kind + '][' + f.scene + '] ' + f.query
+    if (f.kind === 'stale') console.log(head + ' -> ' + f.detail)
+    else if (f.kind === 'noAnswer') console.log(head + ' -> ' + f.detail)
+    else if (f.kind === 'emptyRecall') console.log(head + ' -> 期望「' + f.expected + '」，返回 0 条')
+    else console.log(head + ' -> 期望「' + f.expected + '」，实际: ' + (f.got.join(' | ') || '(空)'))
+  }
 }
+
+console.log('\n--- 完整性 ---')
+if (integrityCheck.ok) {
+  console.log('  冻结集指纹 OK: ' + measured.digest.slice(0, 16) + '…  样本 ' + measured.samples + '  阈值与清单一致')
+} else {
+  console.log('  !! 冻结集完整性校验失败，本次数字不能当基线 !!')
+  for (const m of integrityCheck.mismatches) console.log('   - ' + m)
+  console.log('  如果这是有意的重冻（改语料/改阈值），跑 node scripts/quality-frozen.mjs --rebaseline')
+}
+if (labelAudit.issues.length) {
+  console.log('  标签体检 ' + labelAudit.issues.length + ' 项（不代表指标错，只说明标签本身的宽松度）:')
+  for (const i of labelAudit.issues.slice(0, 8)) console.log('   - [' + i.code + '] ' + i.query + ' :: ' + i.detail)
+  if (labelAudit.issues.length > 8) console.log('   - …其余 ' + (labelAudit.issues.length - 8) + ' 项见 JSON labelAudit')
+}
+console.log('  【防作弊面】本脚本没有被改标签/删样本变好的空间：')
+console.log('   - 改 expect/forbid/q、删用例、改语料 → 冻结集指纹不匹配（上面会报）')
+console.log('   - 改 SUPERSEDED / JUNK_FACTS / 阈值 → 同样不匹配')
+console.log('   - expect 写成空串会让 String.includes("") 判每条都命中 → assertCases 直接报错退出')
+
+const jsonPath = emitReport(report, jsonTarget)
+printReportTail(jsonPath, report)
 
 try {
   fs.rmSync(dir, { recursive: true, force: true })
@@ -184,4 +238,26 @@ try {
 
 // 冻结集故意不设门禁：它的数字是用来观察的，不是用来通过的门。
 // 拿它当门禁，迟早会为了让它绿而去改语料或改权重。
+// 但「卷子被改了」不是观察结果，是基线作废：退出码 2，避免被当成绩读。
+if (!integrityCheck.ok) {
+  if (process.argv.includes('--rebaseline')) {
+    console.error('\n新的基线清单（确认是有意重冻后，粘贴到 scripts/eval-report.mjs 的 FROZEN_MANIFEST）:')
+    console.error(
+      JSON.stringify(
+        {
+          digest: measured.digest,
+          samples: measured.samples,
+          answerable: measured.answerable,
+          unanswerable: measured.unanswerable,
+          corpusDigest: measured.corpusDigest,
+          config: FROZEN_MANIFEST.config,
+          harness,
+        },
+        null,
+        2,
+      ),
+    )
+  }
+  process.exit(2)
+}
 process.exitCode = 0
