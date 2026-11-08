@@ -184,6 +184,19 @@ npm run consolidate      # 跑一次固化（幂等）
 - **覆盖率阈值**：只靠 top1 相对阈值会放过噪声，必须加查询 2-gram 命中率下限。
 - **情感只接 `systemPrompt`**：不接 selfwake 的调度闸门，避免两套系统抢方向盘。
 
+## 变更记录
+
+### 2026-11-09
+
+- **内容指纹去重**：`agent/pre-step` 的去重从「查询 + 命中 ID 集合」换成带内容指纹的 Map。
+  记忆内容改过之后，同一条查询会重新注入；内容没变就照旧挡掉。上限仍是 200 条。
+- **工具动作采集**：接上 `tools/post-execute`，只记写类工具（`write` / `edit` / `apply_patch` /
+  `create_skill` / `present`）的目标路径与参数摘要哈希，用来判断并行会话有没有改同一个文件。
+  原始命令、写入内容、old_string 一律不落盘；session 只存 sha1 前 10 位。
+  撞车判定窗口由 `collisionWindowMinutes`（默认 30 分钟）控制，检出后写一条 `kind: collision`
+  到召回日志。开关是 `enableActivity`。
+- 新增两个配置项（共 21 个），新增 `test/activity.test.mjs`、`test/recall-fingerprint.test.mjs`。
+
 ## License
 
 MIT

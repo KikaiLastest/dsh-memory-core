@@ -258,6 +258,27 @@ export const FIELD_DEFS = [
     hint: '写自动捕获和摘要之前，把 sk- / gh*_ / AKIA / Bearer / token= 这类值替换成 [REDACTED]。',
     group: 'summary',
   },
+  {
+    key: 'enableActivity',
+    type: 'boolean',
+    default: true,
+    label: '工具动作采集',
+    hint: '记录写类工具动了哪个文件（只记路径和元数据，不记内容），用来判断并行会话有没有改同一个文件。',
+    group: 'summary',
+  },
+  {
+    key: 'collisionWindowMinutes',
+    type: 'number',
+    default: 30,
+    min: 1,
+    max: 1440,
+    step: 1,
+    integer: true,
+    unit: '分钟',
+    label: '撞车判定窗口',
+    hint: '两条动作相隔多久以内算「同时在改」；窗口太短会漏判，太长会误报。',
+    group: 'summary',
+  },
 ]
 
 /** 只有 key → 默认值 的扁平表。 */

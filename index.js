@@ -10,6 +10,7 @@ import { idOf, loadStatusMap, isRecallable, resolveEntryStatus, filterRecallable
 import { expandWords } from './syn.mjs'
 import { decide } from './abstain.mjs'
 import { hardenRecallText } from './sanitize.mjs'
+import { normalizeToolEvent, recordActivity } from './activity.mjs'
 import {
   fieldDescriptors,
   groupDescriptors,
@@ -1021,8 +1022,18 @@ export function apply(ctx, config = {}) {
   // seen 只用来挡「同一条查询在同一轮里被多次 pre-step 重复注入」，
   // 所以键里必须带上查询本身：只拿命中 ID 列表当键的话，两个意图不同但碰巧
   // 命中同一批记忆的查询，第二个会被永久跳过。上限 200 条，防止长期运行无界增长。
-  const seen = new Set()
+  //
+  // 2026-11-09：集合换成 Map，值存「命中内容的指纹」。只按 id 去重会把「记忆已经被
+  // 改过、内容不一样了」也当成重复挡掉；带上指纹后，内容真变了才会重新注入。
+  const seen = new Map()
   const SEEN_LIMIT = 200
+
+  const hitsFingerprint = (list) =>
+    crypto
+      .createHash('sha1')
+      .update(list.map((h) => String((h.entry && h.entry.text) || '')).join('\u0000'))
+      .digest('hex')
+      .slice(0, 16)
 
   try {
     ctx.on(
@@ -1098,12 +1109,13 @@ export function apply(ctx, config = {}) {
 
           const key = query.slice(0, 120) + '|' + hits.map((h) => h.entry.id).join('|')
           const scored = hits.map((h) => h.entry.id + ':' + h.score.toFixed(3) + ':c' + h.coverage.toFixed(2))
-          if (seen.has(key)) {
+          const fingerprint = hitsFingerprint(hits)
+          if (seen.get(key) === fingerprint) {
             appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: scored, ms, injected: false, reason: 'dedup' })
             return decision
           }
-          seen.add(key)
-          if (seen.size > SEEN_LIMIT) seen.delete(seen.values().next().value)
+          seen.set(key, fingerprint)
+          if (seen.size > SEEN_LIMIT) seen.delete(seen.keys().next().value)
 
           const text = buildBlock(hits, verdict, cfg.recallMaxChars ?? 800)
           appendLog(cfg.logFile, { at: new Date().toISOString(), query: query.slice(0, 80), hits: scored, ms, injected: true, verdict, reason: verdictReason })
@@ -1111,6 +1123,49 @@ export function apply(ctx, config = {}) {
         } catch {
           return decision
         }
+      },
+      { prepend: true },
+    )
+  } catch {
+    /* best-effort */
+  }
+
+  // 工具动作采集：只记写类工具的目标路径，用来判并行会话撞车（不记内容）。
+  // 采集失败一律静默 —— 它只是旁路信息，不该影响工具本身的结果。
+  function recordTool(payload) {
+    const ev = normalizeToolEvent(payload)
+    if (!ev) return
+    const file = cfg.activityFile || path.join(path.dirname(cfg.logFile), 'activity.jsonl')
+    const res = recordActivity({
+      file,
+      session: ev.session,
+      tool: ev.tool,
+      args: ev.args,
+      windowMs: (cfg.collisionWindowMinutes ?? 30) * 60000,
+    })
+    if (res && res.collisions.length) {
+      appendLog(cfg.logFile, {
+        at: new Date().toISOString(),
+        kind: 'collision',
+        path: res.path,
+        sessions: res.collisions.map((c) => c.session).slice(0, 5),
+        injected: false,
+        reason: 'collision',
+      })
+    }
+  }
+
+  try {
+    ctx.on(
+      'tools/post-execute',
+      async (payload, next) => {
+        const out = typeof next === 'function' ? await next() : undefined
+        try {
+          if (cfg.enableActivity !== false) recordTool(payload)
+        } catch {
+          /* best-effort */
+        }
+        return out
       },
       { prepend: true },
     )
