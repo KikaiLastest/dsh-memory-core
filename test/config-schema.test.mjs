@@ -9,9 +9,10 @@ import {
   validatePatch,
 } from '../config.mjs'
 
-// 1. 表本身：17 个参数、key 不重复、字符串/数字/布尔都有范围或默认值
+// 1. 表本身：19 个参数、key 不重复、字符串/数字/布尔都有范围或默认值
 // （2026-10-22 新增 statusFilter；状态过滤默认关闭，理由见 config.mjs 里该字段的 hint）
-assert.equal(FIELD_DEFS.length, 17, '17 个可调参数')
+// （2026-11-08 新增 recallMaxChars 注入上限、minWeightedCoverage 加权覆盖率诊断项）
+assert.equal(FIELD_DEFS.length, 19, '19 个可调参数')
 const keys = FIELD_DEFS.map((f) => f.key)
 assert.equal(new Set(keys).size, keys.length, 'key 不重复')
 for (const f of FIELD_DEFS) {
@@ -38,6 +39,14 @@ assert.equal(byKey.summaryMaxChars.default, 600)
 assert.equal(byKey.summarizeIntervalMinutes.default, 10)
 assert.equal(byKey.summarizeIdleMinutes.default, 30)
 assert.equal(byKey.summaryMaxChars.group, 'summary', '新参数归到 summary 分组')
+
+// 1c. 2026-11-08 新增：注入上限有默认值且范围合法；加权覆盖率默认关闭
+assert.equal(byKey.recallMaxChars.default, 800, '单条注入默认 800 字')
+assert.equal(byKey.recallMaxChars.min, 200)
+assert.equal(byKey.recallMaxChars.max, 4000)
+assert.equal(byKey.minWeightedCoverage.default, 0, '加权覆盖率硬门槛默认关闭')
+assert.equal(normalizeConfig({ recallMaxChars: 99999 }).recallMaxChars, 4000, '注入上限夹到 4000')
+assert.equal(normalizeConfig({ recallMaxChars: 10 }).recallMaxChars, 200, '注入上限夹到 200')
 assert.ok(GROUPS.some((g) => g.id === 'summary'), 'summary 分组存在')
 
 // 2. normalizeConfig：坏值退回默认值，越界夹回范围，0 不被当成空
