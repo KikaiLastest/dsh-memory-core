@@ -196,6 +196,9 @@ npm run consolidate      # 跑一次固化（幂等）
   撞车判定窗口由 `collisionWindowMinutes`（默认 30 分钟）控制，检出后写一条 `kind: collision`
   到召回日志。开关是 `enableActivity`。
 - 新增两个配置项（共 21 个），新增 `test/activity.test.mjs`、`test/recall-fingerprint.test.mjs`。
+- **存储 GC**（`gc.mjs`，`npm run gc`）：轮转 `*.bak-*` 只留最新一份、清 0 字节且过期超 60 分钟的
+  `.dsh-ops-update-*.lock`、把超 600 字的 quote 截断并标注原文字数。全部 best-effort，不清坏就留着。
+  本次实跑清掉 1 份旧备份（90 KB）和 5 个僵尸锁。
 
 ## License
 
