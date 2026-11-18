@@ -1158,8 +1158,8 @@ export function apply(ctx, config = {}) {
   try {
     ctx.on(
       'tools/post-execute',
-      async (payload, next) => {
-        const out = typeof next === 'function' ? await next() : undefined
+      async (payload, result, next) => {
+        const out = typeof next === 'function' ? await next() : result
         try {
           if (cfg.enableActivity !== false) recordTool(payload)
         } catch {
